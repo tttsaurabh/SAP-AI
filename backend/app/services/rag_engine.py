@@ -79,10 +79,14 @@ class RAGEngine:
         # Score semantic results
         for rank, hit in enumerate(semantic_results):
             doc_id = hit["document_id"]
-            # Find chunk index by checking database
+            # Find chunk row by checking database -- this reconciliation lookup
+            # already existed to recover chunk_index; extend it to also
+            # capture the real DB chunk_id, since the vector store payload
+            # itself carries no chunk_id (only text/doc/page/section).
             chunk_obj = db.query(Chunk).filter(Chunk.document_id == doc_id, Chunk.text == hit["text"]).first()
             chunk_idx = chunk_obj.chunk_index if chunk_obj else 0
-            
+            hit["chunk_id"] = chunk_obj.id if chunk_obj else None
+
             key = (doc_id, chunk_idx)
             if key not in rrf_scores:
                 rrf_scores[key] = {
@@ -90,7 +94,7 @@ class RAGEngine:
                     "score": 0.0
                 }
             rrf_scores[key]["score"] += 1.0 / (k + rank + 1)
-            
+
         # Score keyword results
         for rank, chunk in enumerate(keyword_results):
             key = (chunk.document_id, chunk.chunk_index)
@@ -98,9 +102,10 @@ class RAGEngine:
                 # Find document filename
                 doc = db.query(Document).filter(Document.id == chunk.document_id).first()
                 filename = doc.filename if doc else "Unknown"
-                
+
                 rrf_scores[key] = {
                     "chunk": {
+                        "chunk_id": chunk.id,
                         "text": chunk.text,
                         "document_id": chunk.document_id,
                         "filename": filename,
@@ -262,15 +267,24 @@ ASSISTANT RESPONSE:"""
         citations = []
         # Find all brackets like [1], [2], [1][2], etc.
         citation_indices = set(map(int, re.findall(r'\[(\d+)\]', response_text)))
-        
-        for idx in citation_indices:
+
+        for idx in sorted(citation_indices):
             if 0 < idx <= len(chunks):
                 chunk = chunks[idx - 1]
+                # Truncate to a generous ceiling above the chunker's default
+                # target chunk size (450 tokens, ~1200-1800 chars typically)
+                # so normal-sized chunks come through whole, while pathological
+                # oversized chunks (e.g. an un-splittable code block) don't
+                # blow up the citation payload.
+                chunk_text = chunk.get("text", "") or ""
+                citation_text = chunk_text[:1500]
                 citations.append({
                     "doc_name": chunk["filename"],
                     "page": chunk["page_number"],
                     "section": chunk["section_header"],
-                    "url": None # can add external document links later
+                    "url": None, # can add external document links later
+                    "chunk_id": chunk.get("chunk_id"),
+                    "text": citation_text
                 })
-                
+
         return response_text, citations

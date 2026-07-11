@@ -5,6 +5,11 @@ export interface Citation {
   page?: number;
   section?: string;
   url?: string;
+  chunk_id?: number;
+  // Actual cited passage text from the source chunk. May be an empty string
+  // for citations saved before this field existed (older messages) -- treat
+  // "" as "unavailable", never fall back to fabricated placeholder text.
+  text: string;
 }
 
 export interface Message {

@@ -81,6 +81,13 @@ class CitationSchema(BaseModel):
     page: Optional[int] = None
     section: Optional[str] = None
     url: Optional[str] = None
+    chunk_id: Optional[int] = None
+    # Actual cited passage text from the source chunk (possibly truncated --
+    # see RAGEngine.generate_response). Defaults to "" for citations saved
+    # before this field existed, so older messages deserialize cleanly; the
+    # frontend renders an explicit "unavailable" fallback rather than fake
+    # placeholder text when this is empty.
+    text: str = ""
 
 class MessageCreate(BaseModel):
     content: str

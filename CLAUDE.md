@@ -75,8 +75,6 @@ side effect of unrelated work.)
   PDFs can take minutes to process.
 - Chat "streaming" in the frontend is simulated word-by-word chunking of an
   already-complete response, not true token-level LLM streaming.
-- The citation side-drawer UI shows placeholder/summary text rather than the
-  actual cited passage from the source chunk.
 - "Hybrid search" (`RAGEngine.hybrid_search`) is currently just a SQL
   `ILIKE` keyword scan combined with vector search — there is no real
   full-text/BM25 index, despite `rank-bm25` being a dependency.
@@ -271,3 +269,77 @@ enum swap, isolated; (b) everything else in this phase.
 - `fastapi` is not installed in this sandbox; the HTTP/router layer
   (`app.main`, `TestClient`-style tests) could not be exercised end-to-end
   here, only the ORM/model/migration layer.
+
+### 2026-07-12 — Phase 2: Real citations
+
+Non-security remediation fixing the "Source Verification" citation drawer,
+which previously rendered a **hardcoded fake placeholder string** for every
+citation regardless of which one was clicked, because the backend never
+sent real chunk text or a `chunk_id` to begin with. Verified against a
+scratch SQLite DB (`alembic upgrade head` / `downgrade -1` / full
+`downgrade base` → `upgrade head` round-trip), plus an ORM/service-layer
+script exercising `RAGEngine.hybrid_search`'s two origins (keyword-search
+`Chunk` rows and a stubbed vector-store hit dict) and `generate_response`'s
+citation building, `Citation` row insert, and its FK `ondelete` behavior
+(`chunk_id` → NULL on chunk delete, rows CASCADE-deleted with the parent
+message — SQLite needed `PRAGMA foreign_keys=ON` enabled explicitly for
+this test, since `app/core/database.py` doesn't set it and Postgres
+enforces natively either way). `fastapi` still isn't installed in this
+sandbox (same limitation as Phases 0/1), so `backend/tests/test_basic.py`
+was run via `python -m unittest` (3/3 pass) rather than `pytest`/`TestClient`.
+
+**1. New `Citation` join table** (`backend/app/models/models.py`): `id`,
+`message_id` FK → `messages.id` `ON DELETE CASCADE`, `chunk_id` FK →
+`chunks.id` `ON DELETE SET NULL` (nullable — a cited chunk can be deleted,
+e.g. document reprocessed, without losing the historical citation record),
+`rank`, `created_at`. **Purely additive**: `Message.citations` (JSON) is
+unchanged and remains the fast denormalized read path for the chat UI;
+`citations` (the new table) exists for durable joinability (e.g. "which
+chunks get cited most"), not as a replacement. Migration:
+`backend/alembic/versions/180c1b30601c_phase2_citation_table.py`.
+
+**2. Backend: `chunk_id` + real `text` threaded through the citation
+payload** (`backend/app/services/rag_engine.py`):
+- `hybrid_search`'s RRF fusion now sets a `chunk_id` key on every chunk
+  dict it produces, regardless of origin: for keyword-search-origin chunks
+  (already SQLAlchemy `Chunk` ORM objects) it's just `chunk.id`; for
+  semantic-search-origin hits (plain dicts from the vector store payload,
+  which carries no DB id) it extends the RRF-keying lookup that already
+  existed to recover `chunk_index` (`db.query(Chunk).filter(document_id=...,
+  text=...)`) to also capture `chunk_obj.id`.
+- `generate_response`'s `[N]`-bracket-citation-marker parsing now includes
+  `chunk_id` and the chunk's real `text` (truncated to 1500 chars — a
+  generous ceiling above the chunker's ~450-token/1200–1800-char default
+  target chunk size, so normal chunks pass through whole) in each citation
+  dict. Iteration order changed from `set` (arbitrary) to `sorted(...)` so
+  citation `rank` (used by the new `Citation` rows) is deterministic.
+- `backend/app/schemas/schemas.py`'s `CitationSchema` gained `chunk_id:
+  Optional[int] = None` and `text: str = ""` (defaulted, not required — so
+  older `Message.citations` JSON blobs saved before this change, which lack
+  `text`/`chunk_id`, still deserialize instead of raising a validation
+  error).
+- `backend/app/api/chat.py`'s stream handler: after committing the
+  assistant `Message` (unchanged), bulk-inserts one `Citation` row per
+  citation (`message_id`, `chunk_id`, `rank`=index) in the same request,
+  via `db.bulk_save_objects` + `db.commit()`.
+
+**3. Frontend: render real citation text**:
+- `frontend/lib/api.ts`'s `Citation` interface gained `chunk_id?: number`
+  and `text: string` (matches the backend field names exactly).
+- `frontend/app/chat/page.tsx`: the citation badge click handler already
+  passed the full citation object into `selectedCitation` state (no change
+  needed there). Replaced the hardcoded fake "CITED SEGMENT TEXT" paragraph
+  in the Source Verification drawer with `{selectedCitation.text}`, guarded
+  by an `if (selectedCitation.text)` check — falls back to an honest
+  "Source text unavailable for this citation." message (not fake text) when
+  `text` is empty, e.g. for messages saved before this change shipped.
+
+**Follow-ups for later phases**:
+- `Collection.embedding_version`, `Document.collection_name` follow-ups
+  from Phase 1 are still open (see that entry).
+- The new `Citation` table has no API surface yet (no endpoint reads it) —
+  it exists for future analytics ("most-cited chunks") but nothing queries
+  it today.
+- Postgres-specific FK `ondelete` behavior (`SET NULL`/`CASCADE`) is
+  enforced natively there; only verified against SQLite with
+  `PRAGMA foreign_keys=ON` explicitly enabled in this sandbox (see above).

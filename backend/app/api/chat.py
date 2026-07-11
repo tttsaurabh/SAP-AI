@@ -9,7 +9,7 @@ from typing import List, Dict, Any
 from app.core.database import get_db
 from app.core.security import any_authenticated
 from app.core.roles import Role, MessageRole
-from app.models.models import User, Conversation, Message, Feedback
+from app.models.models import User, Conversation, Message, Feedback, Citation
 from app.schemas.schemas import ConversationResponse, ConversationDetail, MessageResponse, FeedbackCreate, FeedbackResponse
 from app.services.rag_engine import RAGEngine
 
@@ -141,7 +141,23 @@ async def stream_chat_response(
         db.add(assistant_msg)
         db.commit()
         db.refresh(assistant_msg)
-        
+
+        # Also persist a durable, joinable Citation row per citation (e.g.
+        # "which chunks get cited most"). Additive alongside the JSON
+        # `citations` column above, which stays the fast denormalized read
+        # path for the chat UI. `chunk_id` may be None if the citation's
+        # source chunk couldn't be resolved back to a DB row.
+        if citations:
+            db.bulk_save_objects([
+                Citation(
+                    message_id=assistant_msg.id,
+                    chunk_id=citation.get("chunk_id"),
+                    rank=rank
+                )
+                for rank, citation in enumerate(citations)
+            ])
+            db.commit()
+
         # Yield the tokens chunk by chunk to simulate stream
         # Split by words/whitespace
         tokens = re.findall(r'\S+\s*', response_text)

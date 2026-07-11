@@ -608,9 +608,15 @@ export default function ChatPage() {
                     <Terminal className="h-4.5 w-4.5 text-purple-400" />
                     <span>CITED SEGMENT TEXT</span>
                   </div>
-                  <p className="italic text-slate-300 leading-relaxed font-mono text-xs">
-                    "This section details the primary configuration schema. The Master Data Governance model MM (Material Master) has custom approval stages as described in standard SAP workflows. Change Requests (CR) must comply with validation standards prior to BRF+ rule evaluations..."
-                  </p>
+                  {selectedCitation.text ? (
+                    <p className="italic text-slate-300 leading-relaxed font-mono text-xs">
+                      "{selectedCitation.text}"
+                    </p>
+                  ) : (
+                    <p className="italic text-slate-500 leading-relaxed font-mono text-xs">
+                      Source text unavailable for this citation.
+                    </p>
+                  )}
                 </div>
               </div>
             </div>

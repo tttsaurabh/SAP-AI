@@ -111,6 +111,28 @@ class Message(Base):
 
     conversation = relationship("Conversation", back_populates="messages")
     feedbacks = relationship("Feedback", back_populates="message", cascade="all, delete-orphan")
+    citation_rows = relationship("Citation", back_populates="message", cascade="all, delete-orphan")
+
+class Citation(Base):
+    """
+    Durable, joinable record of a chunk cited by an assistant message
+    (e.g. "which chunks get cited most"). ADDITIVE alongside
+    `Message.citations` (JSON) -- that column remains the fast denormalized
+    read path used by the chat UI today; this table is not a replacement for
+    it, just a normalized index over the same events.
+    """
+    __tablename__ = "citations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    message_id = Column(Integer, ForeignKey("messages.id", ondelete="CASCADE"), nullable=False, index=True)
+    # Nullable + SET NULL: a cited chunk can be deleted (e.g. document
+    # reprocessed/removed) without destroying the historical citation record.
+    chunk_id = Column(Integer, ForeignKey("chunks.id", ondelete="SET NULL"), nullable=True, index=True)
+    rank = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    message = relationship("Message", back_populates="citation_rows")
+    chunk = relationship("Chunk")
 
 class Feedback(Base):
     __tablename__ = "feedbacks"
