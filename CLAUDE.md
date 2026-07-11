@@ -23,9 +23,10 @@ Do not describe it as connected to a real SAP system.
 - **LLM provider cascade**: Gemini → OpenAI → Anthropic → mock fallback (see
   `backend/app/services/rag_engine.py`). First provider with a configured API
   key wins; if none are configured, a canned mock response is generated.
-- **Other infra**: Redis (session cache / task queue), BM25 keyword scoring
-  (`rank-bm25` dependency present but current "hybrid search" is SQL `ILIKE`
-  — see limitations below).
+- **Other infra**: Redis (session cache / task queue). Hybrid search's
+  keyword leg uses real Postgres full-text search (`tsvector`/GIN index,
+  see Phase 4) — the `rank-bm25` dependency that used to sit unused
+  alongside a SQL `ILIKE` scan has been removed.
 
 ## Key directories
 
@@ -78,11 +79,17 @@ side effect of unrelated work.)
   an already-complete response~~ — **fixed in Phase 3**: the SSE endpoint
   now forwards real per-token deltas from the provider SDKs' native
   streaming interfaces. See the Phase 3 Work Log entry.
-- "Hybrid search" (`RAGEngine.hybrid_search`) is currently just a SQL
+- ~~"Hybrid search" (`RAGEngine.hybrid_search`) is currently just a SQL
   `ILIKE` keyword scan combined with vector search — there is no real
-  full-text/BM25 index, despite `rank-bm25` being a dependency.
-- No reranking is actually performed despite `RERANK_ENABLED` /
-  `RERANK_MODEL` config flags existing in `core/config.py`.
+  full-text/BM25 index, despite `rank-bm25` being a dependency.~~ — **fixed
+  in Phase 4**: the keyword-search leg now uses real Postgres full-text
+  search (`plainto_tsquery`/`ts_rank` over a generated `tsvector` column +
+  GIN index). **Postgres-only** — see the Phase 4 Work Log entry for the
+  SQLite limitation this introduces.
+- ~~No reranking is actually performed despite `RERANK_ENABLED` /
+  `RERANK_MODEL` config flags existing in `core/config.py`.~~ — **fixed in
+  Phase 4**: a real cross-encoder reranker (`backend/app/services/reranker.py`)
+  now consumes both flags. See the Phase 4 Work Log entry.
 
 ## Deferred security work
 
@@ -573,3 +580,155 @@ on `frontend/` passes with zero errors.
   propagation logic, not against real Gemini/OpenAI/Anthropic endpoints.
   Re-verify token-by-token behavior against live keys before relying on
   this in production.
+
+### 2026-07-12 — Phase 4: Real hybrid search + reranker
+
+Non-security remediation fixing two items flagged by the architecture
+review: `RAGEngine.hybrid_search`'s "keyword search" leg was a
+`Chunk.text.ilike('%word%')` full-table scan with no index (despite
+`rank-bm25` sitting in `requirements.txt`, never actually imported/used
+anywhere), and `RERANK_ENABLED`/`RERANK_MODEL` were dead config flags in
+`core/config.py`/`.env.example` with zero references anywhere else in the
+codebase (confirmed by grep before starting). `fastapi` and
+`sentence-transformers` are still not installed in this sandbox (same
+limitation as every prior phase), and no live Postgres instance was
+available either, so verification here is code-review-level plus targeted
+logic tests against mocks/fakes, not a live end-to-end run — see the
+per-item verification notes below.
+
+**1. Real Postgres full-text search** (`backend/app/models/models.py`,
+`backend/app/services/rag_engine.py`,
+`backend/alembic/versions/e2a7c4f91b30_phase4_fulltext_search.py`):
+- New hand-written migration adds a **Postgres-only** generated column:
+  `ALTER TABLE chunks ADD COLUMN text_search tsvector GENERATED ALWAYS AS
+  (to_tsvector('english', text)) STORED` plus `CREATE INDEX
+  idx_chunks_text_search ON chunks USING GIN(text_search)`. Alembic can't
+  autogenerate `GENERATED ALWAYS AS` columns, so this is raw `op.execute`
+  SQL, per the plan. Both `upgrade()`/`downgrade()` check
+  `op.get_bind().dialect.name` and no-op on any non-Postgres dialect
+  instead of raising.
+- `Chunk.text_search` mapped in `models.py` as
+  `deferred(Column(TSVECTOR, Computed("to_tsvector('english', text)",
+  persisted=True)))`: `Computed(...)` marks it server-generated so
+  SQLAlchemy never includes it in INSERT/UPDATE value lists (confirmed via
+  a scratch script: the ORM issues `INSERT INTO chunks (...) VALUES (...)
+  RETURNING id, text_search` — no `text_search` in the value list, only in
+  the RETURNING clause); `deferred()` keeps it out of the default SELECT
+  column list for ordinary `db.query(Chunk)`/`select(Chunk)` reads
+  elsewhere in the codebase — confirmed by compiling a `select(Chunk)...`
+  statement against the Postgres dialect and inspecting the column list
+  (see verification note below).
+- **Known, deliberate SQLite limitation** (documented at length in the
+  `Chunk.text_search` comment in `models.py`): because the migration only
+  adds this physical column on Postgres, a SQLite-backed `chunks` table
+  genuinely lacks it. SQLAlchemy still references the mapped column when
+  building the generated INSERT's `RETURNING` clause regardless of
+  `deferred()` (deferred only affects SELECT-time loading, not
+  INSERT/UPDATE statement generation) — confirmed empirically: inserting a
+  `Chunk` row against a scratch SQLite DB that had this migration applied
+  (a no-op there) fails with `sqlite3.OperationalError: no such column:
+  text_search`. This means, unlike Phases 0-3, **this migration/column
+  could not be round-trip-verified against SQLite for real DB
+  operations** — only the migration chain itself was round-tripped
+  (`upgrade head` / `downgrade -1` / re-`upgrade head` against a scratch
+  SQLite DB, which succeeds because both directions correctly no-op on a
+  non-Postgres dialect). `backend/tests/test_basic.py` is unaffected
+  because none of its 3 tests touch a real DB (`RAGEngine.hybrid_search`
+  and the DB session are both mocked in the one test that goes through
+  `RAGEngine`). No live Postgres instance was available in this sandbox to
+  verify the actual generated-column/GIN-index DDL or a real insert/query
+  round-trip — the SQL was reviewed by hand and the ORM-side query was
+  compiled (not executed) against the Postgres dialect to check syntax
+  (see below). Re-verify against a real Postgres instance before deploying.
+- `RAGEngine._db_keyword_search` (`rag_engine.py`): replaced the
+  keyword-extraction-plus-`ILIKE`-`OR`-chain loop with
+  `func.plainto_tsquery('english', query)` filtered via
+  `Chunk.text_search.op('@@')(tsquery)` and ordered by
+  `func.ts_rank(Chunk.text_search, tsquery).desc()`. Collection scoping is
+  unchanged (`Document.collection_name == collection_name` — verified live
+  that `hybrid_search`/`_db_keyword_search` still key off
+  `collection_name`, not `collection_id`; the Phase 1 decision to keep
+  `collection_name` as the source of truth for search/vector-store paths
+  is still in effect, so this fix didn't touch that). Verified the exact
+  generated SQL by compiling the equivalent `select(Chunk).join(Document)
+  .where(...)` statement against `sqlalchemy.dialects.postgresql.dialect()`
+  (not executed against a real DB): produces
+  `... WHERE documents.collection_name = %(...)s AND (chunks.text_search @@
+  plainto_tsquery(%(...)s, %(...)s)) ORDER BY ts_rank(chunks.text_search,
+  plainto_tsquery(%(...)s, %(...)s)) DESC LIMIT %(...)s`, and confirmed
+  `text_search` does NOT appear in the SELECT column list (the `deferred()`
+  wrapper working as intended).
+- Removed `rank-bm25==0.2.2` from `backend/requirements.txt` — grep
+  confirmed zero references to it anywhere in the codebase before removal
+  (it was never imported), and real Postgres FTS now replaces the role the
+  `ILIKE` scan used to occupy.
+
+**2. Real cross-encoder reranker** (new
+`backend/app/services/reranker.py`, `backend/app/services/rag_engine.py`):
+- New `Reranker` class lazily loads and caches a
+  `sentence_transformers.CrossEncoder` as a class-level singleton, mirroring
+  `EmbeddingsService._local_model`'s exact caching pattern in
+  `embeddings.py` (lazy load on first use, guarded by a class attribute,
+  cached thereafter). Default model is `settings.RERANK_MODEL` if set, else
+  `cross-encoder/ms-marco-MiniLM-L-6-v2`. Logs a one-time `logger.warning`
+  (upgraded from `embeddings.py`'s `logger.info` on local-model load, since
+  scoring N pairs per request is a heavier, more latency-visible operation)
+  on first model load, warning about latency.
+- `Reranker.rerank(query, candidates)` scores `(query, candidate["text"])`
+  pairs via `model.predict(pairs)`, adds a `rerank_score` key to each
+  candidate dict (preserving all existing keys), and returns candidates
+  sorted descending by score. No-ops (returns input unchanged) when
+  `RERANK_ENABLED` is false, fewer than 2 candidates are passed,
+  `sentence_transformers` isn't installed, or scoring raises for any reason
+  — reranking is an enhancement, never a hard dependency for retrieval to
+  keep working.
+- `RAGEngine.hybrid_search`: when `settings.RERANK_ENABLED` is true, the RRF
+  fusion/dedup loop now collects up to `max(limit * 3, 15)` candidates
+  (instead of stopping at `limit`) before calling `Reranker.rerank(query,
+  final_results)`, then truncates to `limit` afterward. When the flag is
+  false, `fusion_limit == limit`, so the RRF loop stops exactly where it
+  always did and `Reranker.rerank` (called unconditionally, but itself a
+  no-op when the flag is off) returns the list unchanged — **verified this
+  is a byte-for-byte no-op when disabled**, not just "close enough": with
+  `RERANK_ENABLED=False` and 20 fake semantic hits fed through a mocked
+  vector backend, `hybrid_search` returned exactly 5 results and the
+  (mocked) `Reranker.rerank` was invoked with exactly 5 candidates, no
+  widening. With `RERANK_ENABLED=True` under the same fake data,
+  `Reranker.rerank` was invoked with exactly 15 candidates and the final
+  result was still truncated to 5.
+- Reranking is applied to the original (non-SAP-abbreviation-expanded)
+  `query` string, not `expand_query`'s output — a cross-encoder scores
+  actual query/passage semantic relevance and is expected to perform better
+  against the user's real phrasing than a query mechanically padded with
+  expansion terms (e.g. `"BP" -> "BP Business Partner"`); the expanded
+  query is still what both the vector search and full-text search legs use
+  for recall.
+- **Verification**: `sentence_transformers` is not installed in this
+  sandbox (confirmed via `python -c "import sentence_transformers"` ->
+  `ModuleNotFoundError`), so the real `CrossEncoder`/model-download path is
+  **not verified end-to-end here**. What *is* verified: `Reranker.rerank`'s
+  full branching logic (flag-off no-op, missing-package no-op, <2-candidate
+  no-op, exception-during-predict fallback, score-descending sort, and
+  model-instance caching/reuse across calls) against a hand-written fake
+  `CrossEncoder` class monkeypatched into the module in place of the real
+  one, plus the `hybrid_search` fusion-widening integration behavior
+  described above with `Reranker.rerank` itself mocked out. Re-verify
+  against the real `sentence-transformers` package/model download before
+  relying on this in production.
+
+**Commits**: (a) full-text search (`models.py`, migration,
+`rag_engine.py`'s `_db_keyword_search`, `requirements.txt`); (b) reranker
+(`reranker.py`, `rag_engine.py`'s `hybrid_search` fusion/rerank wiring).
+
+**Follow-ups for later phases**:
+- Postgres-specific DDL in the new migration (generated column, GIN index)
+  is unverified against a live Postgres instance — same class of limitation
+  as prior phases' Postgres-only paths, but notably this phase's SQLite
+  fallback verification path is narrower than prior phases' (chain-only,
+  not data-operation-level — see above).
+- If `Document.collection_name` is ever dropped in favor of `collection_id`
+  (tracked since Phase 1), `_db_keyword_search`'s collection filter needs
+  to move with it — not done here, out of scope for this pass.
+- No live LLM/reranker model download was exercised; the cross-encoder path
+  is verified by code review + mocked-class logic tests only, as noted
+  above.

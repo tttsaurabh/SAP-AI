@@ -1,10 +1,12 @@
 import re
 from typing import List, Dict, Any, Tuple
 from loguru import logger
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models.models import Chunk, Document
 from app.services.vector_db import get_vector_backend
+from app.services.reranker import Reranker
 
 # Import SDKs with fallback
 try:
@@ -56,9 +58,16 @@ class RAGEngine:
         Retrieves relevant document chunks using hybrid search:
         1. Query expansion for SAP abbreviations.
         2. Dense vector search in Qdrant.
-        3. Database keyword search (SQL ILIKE).
+        3. Database keyword search (Postgres full-text search --
+           `plainto_tsquery`/`ts_rank` over the `chunks.text_search`
+           generated tsvector column; see `_db_keyword_search`. Replaces
+           the old SQL `ILIKE` full-table scan as of Phase 4).
         4. Combines results using Reciprocal Rank Fusion (RRF).
         5. Context compression (deduplication).
+        6. Optional cross-encoder reranking (`settings.RERANK_ENABLED`,
+           Phase 4) over a widened RRF candidate pool, truncated to
+           `limit` afterward. No-op when the flag is off -- RRF-order
+           truncation straight to `limit`, exactly as before.
         """
         # 1. Query Expansion
         expanded_query = RAGEngine.expand_query(query)
@@ -119,7 +128,14 @@ class RAGEngine:
             
         # 5. Sort and Deduplicate / Compress
         sorted_hits = sorted(rrf_scores.values(), key=lambda x: x["score"], reverse=True)
-        
+
+        # When reranking is enabled, fuse a wider candidate pool (e.g.
+        # top-15 instead of top-5) so the cross-encoder has real material
+        # to reorder before the final truncation to `limit`. When disabled,
+        # this is exactly `limit` -- identical behavior to before Phase 4
+        # (RRF-order truncation straight to `limit`, no reranking step).
+        fusion_limit = max(limit * 3, 15) if settings.RERANK_ENABLED else limit
+
         seen_texts = set()
         final_results = []
         for hit in sorted_hits:
@@ -128,34 +144,55 @@ class RAGEngine:
             if len(norm_text) >= 20 and norm_text not in seen_texts:
                 seen_texts.add(norm_text)
                 final_results.append(chunk)
-                if len(final_results) >= limit:
+                if len(final_results) >= fusion_limit:
                     break
-        
+
+        # 6. Optional cross-encoder reranking (Phase 4). `Reranker.rerank`
+        # itself also no-ops when RERANK_ENABLED is false, so this call is
+        # always safe to make; the fusion_limit widening above is the only
+        # actual behavior gated on the flag.
+        final_results = Reranker.rerank(query, final_results)
+        final_results = final_results[:limit]
+
         logger.info(f"Hybrid search returned {len(final_results)} fused and compressed results")
         return final_results
 
     @staticmethod
     def _db_keyword_search(db: Session, collection_name: str, query: str, limit: int = 10) -> List[Chunk]:
-        # Simple extraction of keywords from query
-        words = re.findall(r'\b\w{3,15}\b', query.lower())
-        if not words:
+        """
+        Real Postgres full-text search (Phase 4 non-security remediation),
+        replacing the previous `Chunk.text.ilike('%word%')` full-table
+        scan. Uses the `chunks.text_search` generated `tsvector` column +
+        GIN index (see `alembic/versions/e2a7c4f91b30_phase4_fulltext_search.py`
+        and the `Chunk.text_search` column comment in `models.py`):
+        `plainto_tsquery` normalizes/tokenizes `query` the same way the
+        generated column was built (`'english'` config), the `@@` match
+        operator uses the GIN index instead of scanning every row, and
+        `ts_rank` gives real relevance-ordered results instead of an
+        arbitrary DB-returned order over exact substring matches.
+
+        Postgres-only: `text_search`/`tsvector`/`ts_rank` have no SQLite
+        equivalent, so this will error against a non-Postgres database --
+        acceptable since the app's supported/default backend is Postgres
+        (see `DATABASE_URL` default in `core/config.py`) and SQLite was only
+        ever a scratch-verification convenience, never a supported
+        production backend.
+        """
+        if not query or not query.strip():
             return []
-            
+
+        tsquery = func.plainto_tsquery('english', query)
+
         # Select chunks belonging to documents in the collection
         query_filter = db.query(Chunk).join(Document)
         query_filter = query_filter.filter(Document.collection_name == collection_name)
-        
-        # Build keyword search using ILIKE
-        conditions = []
-        for word in words[:5]: # limit keywords to top 5 to avoid slow queries
-            conditions.append(Chunk.text.ilike(f"%{word}%"))
-            
-        if not conditions:
-            return []
-            
-        from sqlalchemy import or_
-        query_filter = query_filter.filter(or_(*conditions))
-        return query_filter.limit(limit).all()
+        query_filter = query_filter.filter(Chunk.text_search.op('@@')(tsquery))
+
+        return (
+            query_filter.order_by(func.ts_rank(Chunk.text_search, tsquery).desc())
+            .limit(limit)
+            .all()
+        )
 
     @staticmethod
     def _build_prompt(chunks: List[Dict[str, Any]], conversation_history: List[Dict[str, str]], query: str) -> str:
