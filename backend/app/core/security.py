@@ -7,6 +7,7 @@ from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.database import get_db
+from app.core.roles import Role
 from app.models.models import User
 
 import bcrypt
@@ -59,11 +60,11 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
     return user
 
 class RoleChecker:
-    def __init__(self, allowed_roles: List[str]):
+    def __init__(self, allowed_roles: List[Role]):
         self.allowed_roles = allowed_roles
 
     def __call__(self, current_user: User = Depends(get_current_user)) -> User:
-        if current_user.role not in self.allowed_roles and current_user.role != "Super Admin":
+        if current_user.role not in self.allowed_roles and current_user.role != Role.SUPER_ADMIN:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="You do not have permission to access this resource"
@@ -71,6 +72,6 @@ class RoleChecker:
         return current_user
 
 # Predefined checkers
-admin_only = RoleChecker(["Super Admin", "SAP Knowledge Manager"])
-consultant_or_above = RoleChecker(["Super Admin", "SAP Knowledge Manager", "SAP Consultant"])
-any_authenticated = RoleChecker(["Super Admin", "SAP Knowledge Manager", "SAP Consultant", "End User"])
+admin_only = RoleChecker([Role.SUPER_ADMIN, Role.KNOWLEDGE_MANAGER])
+consultant_or_above = RoleChecker([Role.SUPER_ADMIN, Role.KNOWLEDGE_MANAGER, Role.CONSULTANT])
+any_authenticated = RoleChecker([Role.SUPER_ADMIN, Role.KNOWLEDGE_MANAGER, Role.CONSULTANT, Role.END_USER])
