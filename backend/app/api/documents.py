@@ -1,12 +1,12 @@
 import os
 import shutil
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, File, Form, status
 from sqlalchemy.orm import Session
 from typing import List
 from loguru import logger
 
 from app.core.config import settings
-from app.core.database import get_db
+from app.core.database import get_db, SessionLocal
 from app.core.security import admin_only
 from app.core.roles import DocumentStatus
 from app.models.models import User, Document, Chunk, Collection
@@ -63,20 +63,104 @@ def list_documents(
 ):
     return db.query(Document).order_by(Document.created_at.desc()).all()
 
+def process_document_ingestion(document_id: int, file_path: str, filename: str, collection_name: str) -> None:
+    """
+    Background task body (invoked via FastAPI `BackgroundTasks`, so it runs
+    AFTER the HTTP response for the upload request has already been sent).
+
+    Contains the actual parse -> chunk -> insert-chunks -> vector-upsert ->
+    status-update pipeline that used to run synchronously inline in the
+    `upload_document` request handler -- this is why large PDFs previously
+    took 170-210s per `backend/ingest_log.txt` and blocked the request the
+    whole time.
+
+    CRITICAL: this does NOT reuse the request-scoped `Session` from
+    `Depends(get_db)` -- that session is closed by the time this function
+    runs (the request has already returned). It opens its own session via
+    `SessionLocal()` and closes it in a `finally` block, matching the
+    "one session per unit of work" pattern `get_db()` itself follows.
+    """
+    db = SessionLocal()
+    try:
+        db_doc = db.query(Document).filter(Document.id == document_id).first()
+        if not db_doc:
+            logger.error(f"process_document_ingestion: document {document_id} not found (deleted before background task ran?)")
+            return
+
+        # 1. Parse File
+        pages = DocumentParser.parse_file(file_path, filename)
+
+        # 2. Chunk File
+        chunks = DocumentChunker.chunk_document(pages)
+
+        # Generate vector IDs here -- single source of truth, reused both for
+        # the vector store upsert and the Chunk.vector_id column, instead of
+        # each vector backend independently deriving its own id formula.
+        for c in chunks:
+            c["vector_id"] = f"doc{document_id}_chunk{c['chunk_index']}"
+
+        # 3. Insert chunks in SQL
+        for c in chunks:
+            chunk_obj = Chunk(
+                document_id=document_id,
+                text=c["text"],
+                chunk_index=c["chunk_index"],
+                page_number=c["page_number"],
+                section_header=c["section_header"],
+                chunk_metadata=c["chunk_metadata"],
+                vector_id=c["vector_id"]
+            )
+            db.add(chunk_obj)
+        db.commit()
+
+        # 4. Insert in Vector Database (Pinecone or Qdrant based on config)
+        vector_backend = get_vector_backend()
+        vector_backend.upsert_chunks(
+            collection_name=collection_name,
+            document_id=document_id,
+            filename=filename,
+            chunks=chunks
+        )
+
+        # 5. Update document status
+        db_doc.status = DocumentStatus.ACTIVE
+        db_doc.total_chunks = len(chunks)
+        db_doc.error_message = None
+        db.commit()
+        logger.info(f"Background ingestion complete for document {document_id} ({filename}): {len(chunks)} chunks")
+
+    except Exception as e:
+        logger.exception(f"Background ingestion failed for document {document_id} ({filename})")
+        try:
+            db_doc = db.query(Document).filter(Document.id == document_id).first()
+            if db_doc:
+                db_doc.status = DocumentStatus.FAILED
+                # Cap length -- an unbounded exception string (e.g. a huge
+                # stack trace embedded in a library's error message)
+                # shouldn't blow up the column/response payload.
+                db_doc.error_message = str(e)[:2000]
+                db.commit()
+        except Exception:
+            logger.exception(f"Failed to record failure status for document {document_id}")
+    finally:
+        db.close()
+
+
 @router.post("/upload", response_model=DocumentResponse, status_code=status.HTTP_201_CREATED)
 async def upload_document(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     collection_name: str = Form("Default"),
     db: Session = Depends(get_db),
     current_user: User = Depends(admin_only)
 ):
     logger.info(f"User {current_user.email} uploading document: {file.filename} to collection '{collection_name}'")
-    
+
     # Create local path
     upload_dir = "./uploads"
     os.makedirs(upload_dir, exist_ok=True)
     file_path = os.path.join(upload_dir, file.filename)
-    
+
     # Save file
     try:
         with open(file_path, "wb") as buffer:
@@ -95,7 +179,13 @@ async def upload_document(
     collection = _get_or_create_collection(db, collection_name, created_by=current_user.id)
     _ensure_embedding_model_compatible(collection)
 
-    # 1. Create Document in DB
+    # 1. Create Document in DB (fast path) -- parse/chunk/embed/upsert are
+    # deferred to a BackgroundTask (process_document_ingestion below) so
+    # this request returns immediately instead of blocking for the 170-210s
+    # a large PDF can take (see backend/ingest_log.txt). The document is
+    # visible in the UI right away with status=processing; the admin page
+    # polls for the status transition to active/failed (see
+    # frontend/app/admin/page.tsx).
     db_doc = Document(
         filename=file.filename,
         file_path=file_path,
@@ -110,58 +200,13 @@ async def upload_document(
     db.commit()
     db.refresh(db_doc)
 
-    try:
-        # 2. Parse File
-        pages = DocumentParser.parse_file(file_path, file.filename)
-
-        # 3. Chunk File
-        chunks = DocumentChunker.chunk_document(pages)
-
-        # Generate vector IDs here -- single source of truth, reused both for
-        # the vector store upsert and the Chunk.vector_id column, instead of
-        # each vector backend independently deriving its own id formula.
-        for c in chunks:
-            c["vector_id"] = f"doc{db_doc.id}_chunk{c['chunk_index']}"
-
-        # 4. Insert chunks in SQL
-        db_chunks = []
-        for c in chunks:
-            chunk_obj = Chunk(
-                document_id=db_doc.id,
-                text=c["text"],
-                chunk_index=c["chunk_index"],
-                page_number=c["page_number"],
-                section_header=c["section_header"],
-                chunk_metadata=c["chunk_metadata"],
-                vector_id=c["vector_id"]
-            )
-            db.add(chunk_obj)
-            db_chunks.append(chunk_obj)
-        db.commit()
-
-        # 5. Insert in Vector Database (Pinecone or Qdrant based on config)
-        vector_backend = get_vector_backend()
-        vector_backend.upsert_chunks(
-            collection_name=collection_name,
-            document_id=db_doc.id,
-            filename=file.filename,
-            chunks=chunks
-        )
-
-        # 6. Update document status
-        db_doc.status = DocumentStatus.ACTIVE
-        db_doc.total_chunks = len(chunks)
-        db.commit()
-        db.refresh(db_doc)
-
-    except Exception as e:
-        logger.exception(f"Parsing/Ingestion failed for file {file.filename}")
-        db_doc.status = DocumentStatus.FAILED
-        db.commit()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Parsing/Ingestion failed: {str(e)}"
-        )
+    background_tasks.add_task(
+        process_document_ingestion,
+        document_id=db_doc.id,
+        file_path=file_path,
+        filename=file.filename,
+        collection_name=collection_name,
+    )
 
     return db_doc
 

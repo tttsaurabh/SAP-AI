@@ -45,6 +45,10 @@ export interface DocumentInfo {
   collection_name: string;
   document_type?: string;
   status: string;
+  // Populated when background ingestion fails (status === "failed"); null/
+  // undefined while processing/active or for documents ingested before
+  // this field existed.
+  error_message?: string | null;
   total_chunks: number;
   created_at: string;
 }

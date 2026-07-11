@@ -59,6 +59,12 @@ class Document(Base):
         SQLAlchemyEnum(DocumentStatus, name="document_status_enum", values_callable=lambda e: [m.value for m in e]),
         default=DocumentStatus.PROCESSING,
     )  # processing, active, failed
+    # Set when background ingestion (see process_document_ingestion in
+    # api/documents.py) fails, so a FAILED document is debuggable instead of
+    # silently sitting with no explanation. Cleared (set back to NULL) on a
+    # later successful ingestion of the same row. Nullable/unused while
+    # status is processing/active.
+    error_message = Column(Text, nullable=True)
     total_chunks = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)

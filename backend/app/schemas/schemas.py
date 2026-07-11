@@ -45,6 +45,10 @@ class DocumentResponse(BaseModel):
     collection_id: Optional[int] = None
     document_type: Optional[str]
     status: str
+    # Populated when background ingestion fails (see
+    # process_document_ingestion in api/documents.py); None while
+    # processing/active or for documents ingested before this field existed.
+    error_message: Optional[str] = None
     total_chunks: int
     created_at: datetime
 

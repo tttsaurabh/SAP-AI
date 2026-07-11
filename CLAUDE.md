@@ -71,10 +71,13 @@ Do not describe it as connected to a real SAP system.
 (These are tracked for later implementation phases — do not "fix" them as a
 side effect of unrelated work.)
 
-- Document ingestion is synchronous and blocks the request thread; large
-  PDFs can take minutes to process.
-- Chat "streaming" in the frontend is simulated word-by-word chunking of an
-  already-complete response, not true token-level LLM streaming.
+- ~~Document ingestion is synchronous and blocks the request thread~~ —
+  **fixed in Phase 3**: ingestion now runs via FastAPI `BackgroundTasks`
+  after the upload request returns. See the Phase 3 Work Log entry.
+- ~~Chat "streaming" in the frontend is simulated word-by-word chunking of
+  an already-complete response~~ — **fixed in Phase 3**: the SSE endpoint
+  now forwards real per-token deltas from the provider SDKs' native
+  streaming interfaces. See the Phase 3 Work Log entry.
 - "Hybrid search" (`RAGEngine.hybrid_search`) is currently just a SQL
   `ILIKE` keyword scan combined with vector search — there is no real
   full-text/BM25 index, despite `rank-bm25` being a dependency.
@@ -343,3 +346,230 @@ payload** (`backend/app/services/rag_engine.py`):
 - Postgres-specific FK `ondelete` behavior (`SET NULL`/`CASCADE`) is
   enforced natively there; only verified against SQLite with
   `PRAGMA foreign_keys=ON` explicitly enabled in this sandbox (see above).
+
+### 2026-07-12 — Phase 3: Real streaming + async ingestion
+
+Non-security remediation fixing two items flagged by the architecture
+review: fake word-by-word "streaming" of an already-complete LLM response,
+and synchronous in-request document ingestion blocking the upload request
+for 170-210s on large PDFs (per `backend/ingest_log.txt`). Verified against
+a scratch SQLite DB (`alembic upgrade head` / `downgrade -1` / re-`upgrade
+head` round-trip) plus targeted scripts exercising the new pieces directly
+(not via `TestClient`, since `fastapi` still isn't installed in this
+sandbox — same limitation as Phases 0-2): an ORM round-trip on the new
+`Document.error_message` column through a fresh `SessionLocal()` session
+(mirroring what the background task actually does), `RAGEngine
+.build_citations` against stubbed chunks/response text, the streaming
+fallback-cascade logic (`RAGEngine._stream_llm_response`) with fake
+provider generators covering pre-first-token-failure fallback,
+mid-stream-failure propagation, and the mock-fallback path, and a
+standalone asyncio script validating the sync-generator-to-`asyncio.Queue`
+thread-bridge pattern used in `chat.py` (ordered delivery, mid-stream
+producer exceptions, and early consumer disconnect). `backend/tests
+/test_basic.py` still passes (3/3, `python -m unittest`). `npx tsc --noEmit`
+on `frontend/` passes with zero errors.
+
+**1. Real LLM streaming** (`backend/app/services/rag_engine.py`,
+`backend/app/api/chat.py`):
+- `rag_engine.py`: extracted `_build_prompt` (prompt construction) and
+  `build_citations` (the `[N]`-marker regex parse + citation dict
+  formatting) out of `generate_response` into standalone static methods so
+  both the non-streaming and streaming code paths share the exact same
+  logic instead of two copies drifting apart. Added `_mock_fallback_text`
+  (same canned local response as before, now reusable).
+- Added three provider-specific **streaming** generators, one per SDK,
+  each yielding raw text deltas as the SDK produces them — no artificial
+  buffering:
+  - `_stream_gemini`: `genai.GenerativeModel(...).generate_content(prompt,
+    stream=True)`, iterating chunks and yielding `chunk.text` (guarded
+    with try/except per-chunk, since `.text` can raise on a chunk with no
+    parts, e.g. a safety-filtered piece — one bad chunk no longer kills
+    the whole stream).
+  - `_stream_openai`: `client.chat.completions.create(..., stream=True)`,
+    yielding `chunk.choices[0].delta.content` guarded against `None`/empty
+    choices (final chunk, role-only deltas).
+  - `_stream_anthropic`: `client.messages.stream(...)` as a context
+    manager, yielding from `stream.text_stream`.
+- `_stream_llm_response(prompt, chunks)`: reproduces the same provider
+  fallback order as `generate_response` (Gemini → OpenAI → Anthropic →
+  mock), but adapted for the fact that naive fallback doesn't work once
+  real tokens have reached the client over SSE. Each provider generator is
+  consumed with a `yielded_any` flag: if it raises (or produces nothing)
+  **before** yielding any token, the cascade moves on to the next
+  provider exactly as before; if it raises **after** yielding at least one
+  token, the exception is re-raised (propagated to the caller) instead of
+  silently switching providers — those tokens already reached the client
+  and can't be un-sent. Verified both branches with fake provider
+  generators (see verification note above).
+- `stream_response(db, collection_name, query, conversation_history,
+  chunks_out=None)`: the new public streaming entry point. A generator
+  that does the hybrid search up front (same as `generate_response`),
+  yields the canned "not available" string directly and returns if zero
+  chunks matched (no LLM call), otherwise builds the prompt and delegates
+  to `_stream_llm_response`. `chunks_out`, if passed a list, is populated
+  in place with the retrieved chunks before the first token is yielded, so
+  the caller can build citations after the generator is exhausted via
+  `RAGEngine.build_citations(full_text, chunks_out)` — citations depend on
+  the complete `[N]`-marker text, so they're still computed post-hoc, but
+  now from text that was actually streamed rather than generated
+  up-front.
+- **Documented behavior change**: `generate_response`'s knowledge-boundary
+  safety net re-scans the *complete* response text for the phrase
+  "information is not available" and, if found anywhere, discards the
+  whole response in favor of the canned boundary string. That retroactive
+  whole-response replacement is **not reproduced in the streaming path** —
+  by the time the full text is available, its tokens have already been
+  streamed to the client over SSE and cannot be un-sent. The only boundary
+  case still honored in `stream_response` is the upfront one (zero
+  retrieved chunks → emit the canned string directly without calling any
+  LLM), which is the common case this existed for. This is an intentional,
+  necessary consequence of real streaming, not an oversight.
+- `chat.py`'s `/conversations/{conv_id}/stream` endpoint: replaced the
+  "generate full response in an executor, then re-chunk word-by-word with
+  `asyncio.sleep(0.01)`" logic with a real bridge from the synchronous
+  provider-SDK streaming generator to the async SSE response. Concretely:
+  a plain `threading.Thread` runs `RAGEngine.stream_response(...)` and
+  pushes each yielded delta into an `asyncio.Queue` via
+  `loop.call_soon_threadsafe(queue.put_nowait, ...)`; the async
+  `event_generator()` coroutine `await`s the queue and forwards each delta
+  as an SSE `content` event as it arrives — cadence is now real
+  token-arrival timing, not an artificial `sleep`. After the producer
+  signals completion (a sentinel object) or the loop breaks, the full
+  accumulated text is used to build citations
+  (`RAGEngine.build_citations`) and the `Message`/`Citation` DB writes
+  happen exactly as before (same shapes, same SSE `citations` + `done`
+  events) — the SSE wire protocol is unchanged, so `frontend/lib/api.ts`'s
+  `streamResponse` needed no changes; only the `content` event cadence
+  changed from artificial-typewriter to real per-token.
+- **Disconnect handling** (actual behavior achieved, not aspirational):
+  the endpoint now takes `request: Request` and calls `await request
+  .is_disconnected()` every 5 forwarded tokens (not every single one, since
+  it's itself an async call). If the client has disconnected, the consumer
+  coroutine stops pulling from the queue and returns immediately *without*
+  saving the assistant `Message`/`Citation` rows for that turn — an
+  abandoned stream leaves no orphaned "assistant said nothing" message.
+  What is **not** achieved: true cancellation of the in-flight provider
+  SDK call. The background `threading.Thread` is not signaled to stop; it
+  keeps running the synchronous Gemini/OpenAI/Anthropic streaming call to
+  completion (or failure) in the background and its output is simply
+  discarded (nothing is left draining the queue). This is the documented
+  best-effort behavior the task explicitly allows for ("full cancellation
+  ... is not always possible") — the thread is a daemon thread so it does
+  not block process shutdown, and it terminates on its own once the
+  underlying HTTP call to the LLM provider finishes.
+- The DB session (`db`, from `Depends(get_db)`) is used from the
+  background thread (inside `stream_response`/hybrid_search) and, after
+  the thread signals done, from the async coroutine (citation build +
+  message insert) — sequentially, never concurrently from two threads at
+  once (the coroutine only touches `db` again after the queue delivers the
+  terminal sentinel), which is the same safety property the prior
+  `run_in_executor`-based code already relied on.
+
+**2. Async document ingestion** (`backend/app/api/documents.py`,
+`backend/app/models/models.py`, `backend/app/schemas/schemas.py`,
+`backend/alembic/versions/6d3f9a1c8b52_phase3_document_error_message.py`):
+- **Decision: FastAPI `BackgroundTasks`, not Celery/RQ, and Redis stays
+  unused — deliberately, not an oversight.** `docker-compose.yml`
+  provisions a `redis` service, but nothing in the app reads from it. For
+  this single-instance FastAPI deployment, `BackgroundTasks` gives
+  in-process, no-new-infra async execution that's good enough: the
+  background function runs in the same process after the HTTP response is
+  sent, no message broker, no separate worker process, no serialization of
+  job arguments across a queue. The tradeoffs accepted knowingly: a
+  background task is lost if the process crashes/restarts mid-ingestion
+  (no persistence/retry across restarts, unlike a Celery/RQ queue backed
+  by Redis), and there's no fan-out to multiple worker processes/machines
+  for very high ingestion volume. Given the app's current single-instance
+  deployment and the fact that the *problem being fixed* was "the request
+  blocks," not "we need horizontal ingestion throughput," `BackgroundTasks`
+  is the appropriately-sized fix. Wiring up Celery/RQ on top of the
+  already-provisioned Redis container is a reasonable future step if
+  ingestion volume or reliability requirements grow — tracked as a
+  follow-up, not attempted here.
+- `documents.py`'s `POST /upload` handler is now split: the fast path
+  validates the file, saves it to disk, does the `Collection` get-or-create
+  + embedding-model-compatibility check (unchanged from Phase 1), creates
+  the `Document` row with `status=DocumentStatus.PROCESSING`, commits, and
+  returns the `201` response immediately (same response shape as before —
+  `DocumentResponse`). It then calls `background_tasks.add_task
+  (process_document_ingestion, document_id=..., file_path=..., filename=
+  ..., collection_name=...)`.
+- New module-level function `process_document_ingestion(document_id,
+  file_path, filename, collection_name)` (not a route handler) contains
+  the actual parse → chunk → insert-chunks → vector-upsert → status-update
+  pipeline that used to run inline in the request handler. **Critically**,
+  it does **not** reuse the request-scoped `Session` from `Depends
+  (get_db)` — that session is closed by the time a `BackgroundTasks`
+  callback runs (FastAPI runs background tasks after the response has been
+  sent, by which point the request's `finally: db.close()` in `get_db()`
+  has already executed). It opens its own session via `SessionLocal()`
+  (`backend/app/core/database.py`'s existing factory) and closes it in a
+  `finally` block — verified via a scratch-SQLite script that opens a
+  second `SessionLocal()` session mid-"task" and confirms writes made in
+  the first session are visible, matching how a real background task
+  would see the already-committed `Document` row from the fast path.
+- On any exception during ingestion, `process_document_ingestion` sets
+  `Document.status = DocumentStatus.FAILED` and now also sets the new
+  `Document.error_message` column (truncated to 2000 chars) with the
+  exception text, instead of leaving a `FAILED` document with zero
+  explanation. Wrapped in its own inner try/except so a failure to *record*
+  the failure (e.g. the DB connection itself is down) doesn't raise an
+  unhandled exception out of a background task (which FastAPI would just
+  log and swallow silently) — it's logged via `loguru` instead.
+- **New column**: `Document.error_message` (`Text`, nullable) added to
+  `backend/app/models/models.py`, with Alembic migration
+  `6d3f9a1c8b52_phase3_document_error_message.py` (purely additive
+  `ADD COLUMN`, no data migration needed since every existing row simply
+  gets `NULL`). Verified `upgrade head` / `downgrade -1` / re-`upgrade
+  head` round-trip against scratch SQLite. `DocumentResponse` in
+  `schemas.py` gained `error_message: Optional[str] = None` so the admin
+  document list surfaces it.
+- **Known race condition (not fixed here, flagging for awareness)**:
+  `process_document_ingestion` checks the `Document` row still exists at
+  the start, but if an admin calls `DELETE /api/documents/{id}` *after*
+  that check but *while* the background task is still running, the task
+  will go on to insert `Chunk` rows against a `document_id` that no longer
+  exists. `Chunk.document_id` has `ondelete="CASCADE"` but that only
+  protects against orphaned rows for chunks that already existed at
+  delete-time, not chunks inserted by a task that's still in flight. This
+  is a pre-existing class of race (synchronous ingestion had the same
+  window, just a much smaller one) that got wider now that ingestion can
+  run for minutes after the row is visible/deletable in the admin UI —
+  not fixed in this phase, tracked as a follow-up.
+
+**3. Frontend polling** (`frontend/app/admin/page.tsx`,
+`frontend/lib/api.ts`):
+- `DocumentInfo.error_message?: string | null` added to `frontend/lib
+  /api.ts` (matches the new backend field).
+- `admin/page.tsx`: added a second `useEffect` that starts a
+  `setInterval(loadDocuments, 3000)` whenever any listed document has
+  `status === "processing"`, and clears it (via the effect's cleanup
+  function) otherwise — plain polling, not a websocket/SSE channel, per
+  the plan's explicit "keep this minimal" guidance. Effect re-runs on
+  every `documents` state change (i.e. every poll tick), which
+  recreates the interval each cycle rather than letting one interval run
+  indefinitely; functionally equivalent (still polls every ~3s while
+  anything is processing, stops the moment nothing is) at the cost of a
+  minor, harmless extra timer churn — not worth a `useRef`-based
+  micro-optimization for a 3s admin-page poll.
+- The `failed` status badge now has a `title` tooltip showing
+  `doc.error_message` (falling back to a generic "no error details
+  recorded" string for documents that failed before this phase, whose
+  `error_message` is `NULL`).
+
+**Follow-ups for later phases**:
+- Wire Celery/RQ onto the already-provisioned Redis container if
+  ingestion volume/reliability needs outgrow in-process `BackgroundTasks`
+  (see the Decision note above).
+- The `Document` delete-during-background-ingestion race described above
+  is not fixed in this phase.
+- Postgres-specific behavior (the `documents.error_message` `ADD COLUMN`,
+  and `BackgroundTasks` running under a real Postgres connection pool
+  rather than SQLite) is unverified against a live Postgres instance —
+  same limitation as every prior phase in this sandbox.
+- No live LLM API keys were available in this environment, so the actual
+  provider SDK streaming calls (`stream=True` / `messages.stream()`)
+  were verified via fake provider generators exercising the fallback/
+  propagation logic, not against real Gemini/OpenAI/Anthropic endpoints.
+  Re-verify token-by-token behavior against live keys before relying on
+  this in production.

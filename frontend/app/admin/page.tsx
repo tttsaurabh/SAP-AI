@@ -53,6 +53,25 @@ export default function AdminPage() {
     loadAnalytics();
   }, [router]);
 
+  // Ingestion now runs as a background task (see backend/app/api/documents.py's
+  // process_document_ingestion), so the upload response returns immediately
+  // with status="processing" instead of blocking until parsing/embedding
+  // finishes. Poll while any listed document is still "processing" so the
+  // status column picks up the active/failed transition without a manual
+  // refresh. Simple polling (not websocket/SSE) per the plan -- stops
+  // automatically once nothing is processing, and cleans up its interval on
+  // unmount / re-render.
+  useEffect(() => {
+    const hasProcessing = documents.some((d) => d.status === "processing");
+    if (!hasProcessing) return;
+
+    const interval = setInterval(() => {
+      loadDocuments();
+    }, 3000);
+
+    return () => clearInterval(interval);
+  }, [documents]);
+
   const loadDocuments = async () => {
     try {
       const data = await api.listDocuments();
@@ -326,11 +345,14 @@ export default function AdminPage() {
                           <td className="py-3 text-slate-400">{doc.collection_name}</td>
                           <td className="py-3 text-slate-500">{formatBytes(doc.file_size)}</td>
                           <td className="py-3">
-                            <span className={`inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[10px] font-bold ${
-                              doc.status === "active" ? "bg-emerald-500/10 text-emerald-400" :
-                              doc.status === "failed" ? "bg-red-500/10 text-red-400" :
-                              "bg-amber-500/10 text-amber-400 animate-pulse"
-                            }`}>
+                            <span
+                              className={`inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[10px] font-bold ${
+                                doc.status === "active" ? "bg-emerald-500/10 text-emerald-400" :
+                                doc.status === "failed" ? "bg-red-500/10 text-red-400" :
+                                "bg-amber-500/10 text-amber-400 animate-pulse"
+                              }`}
+                              title={doc.status === "failed" ? (doc.error_message || "Ingestion failed (no error details recorded).") : undefined}
+                            >
                               <span className={`h-1.5 w-1.5 rounded-full ${
                                 doc.status === "active" ? "bg-emerald-500" :
                                 doc.status === "failed" ? "bg-red-500" :
