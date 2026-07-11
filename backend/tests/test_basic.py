@@ -9,19 +9,39 @@ from app.services.rag_engine import RAGEngine
 class TestSAPRAGPipeline(unittest.TestCase):
     
     def test_chunker_basic(self):
-        # 1. Test standard document chunking
+        # 1. Test semantic chunking with token-based sizes
         pages = [
             {
                 "page": 1,
-                "text": "SAP ABAP stands for Advanced Business Application Programming. It is a high-level programming language created by SAP. # 1. Introduction to RAP\nThe ABAP RESTful Application Programming Model (RAP) defines the architecture for efficient end-to-end development of intrinsically SAP HANA-optimized OData services.",
-                "metadata": {"headings": ["ABAP Overview"]}
+                "text": (
+                    "# 1. Introduction to RAP\n"
+                    "The ABAP RESTful Application Programming Model (RAP) defines the architecture "
+                    "for efficient end-to-end development of intrinsically SAP HANA-optimized OData services.\n\n"
+                    "```abap\n"
+                    "CLASS zcl_rap_handler DEFINITION PUBLIC.\n"
+                    "  PUBLIC SECTION.\n"
+                    "    METHODS: get_entityset IMPORTING io_request  TYPE REF TO /iwbep/if_mgw_req_entityset.\n"
+                    "ENDCLASS.\n"
+                    "```\n\n"
+                    "## Configuration Steps\n\n"
+                    "1. Open transaction SE80\n"
+                    "2. Navigate to Core Data Services\n"
+                    "3. Create a new CDS view\n"
+                ),
+                "metadata": {"headings": ["Introduction to RAP"]}
             }
         ]
-        chunks = DocumentChunker.chunk_document(pages, chunk_size=200, chunk_overlap=20)
+        chunks = DocumentChunker.chunk_document(pages, chunk_size=450, chunk_overlap=80)
         self.assertGreater(len(chunks), 0)
         self.assertEqual(chunks[0]["page_number"], 1)
         # Verify heading context propagation
         self.assertIsNotNone(chunks[0]["section_header"])
+        # Verify token_count metadata is present
+        self.assertIn("token_count", chunks[0]["chunk_metadata"])
+        # Verify ABAP code block is preserved intact (not split)
+        full_text = "\n".join(c["text"] for c in chunks)
+        self.assertIn("ENDCLASS", full_text)  # code block intact
+
         
     def test_embeddings_fallback(self):
         # 2. Test that embeddings are generated (either by API or deterministic mock fallback)
@@ -33,11 +53,16 @@ class TestSAPRAGPipeline(unittest.TestCase):
     def test_rag_engine_mock_generation(self):
         # 3. Test that RAGEngine returns the exact knowledge boundary string when context is empty
         db_mock = MagicMock()
-        text_resp, citations = RAGEngine.generate_response(db_mock, "Default", "How do I configure BRF+ duplicate checks?")
-        
-        # Since DB is empty, should trigger boundary check fallback
-        self.assertEqual(text_resp, "The requested information is not available in the current SAP knowledge base.")
-        self.assertEqual(len(citations), 0)
+        # Mock hybrid_search to return empty list to simulate empty context
+        original_hybrid_search = RAGEngine.hybrid_search
+        RAGEngine.hybrid_search = MagicMock(return_value=[])
+        try:
+            text_resp, citations = RAGEngine.generate_response(db_mock, "Default", "How do I configure BRF+ duplicate checks?")
+            # Since context is empty, should trigger boundary check fallback
+            self.assertEqual(text_resp, "The requested information is not available in the current SAP knowledge base.")
+            self.assertEqual(len(citations), 0)
+        finally:
+            RAGEngine.hybrid_search = original_hybrid_search
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,28 +1,38 @@
+import os
+
+from alembic import command
+from alembic.config import Config as AlembicConfig
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
 from app.core.config import settings
-from app.core.database import engine, Base, SessionLocal
+from app.core.database import SessionLocal
 from app.core.security import get_password_hash
 from app.models.models import User
 from app.api import auth, documents, chat, admin, sap_agentic
 
-# Setup SQL Database tables
+# Path to backend/alembic.ini, regardless of the process's current working directory.
+ALEMBIC_INI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "alembic.ini")
+
+# Run pending Alembic migrations up to head. This is the single source of
+# schema truth going forward -- schema changes should be made via new
+# Alembic revisions, not by editing models.py alone.
 try:
-    logger.info("Initializing SQL Database schema...")
-    Base.metadata.create_all(bind=engine)
-    logger.info("SQL Schema initialized successfully.")
+    logger.info("Running Alembic migrations to head...")
+    alembic_cfg = AlembicConfig(os.path.normpath(ALEMBIC_INI_PATH))
+    command.upgrade(alembic_cfg, "head")
+    logger.info("Alembic migrations applied successfully.")
     
     # Insert default super-admin user for immediate usability
     db = SessionLocal()
     try:
-        admin_user = db.query(User).filter(User.email == "admin@sap.com").first()
+        admin_user = db.query(User).filter(User.email == "admin").first()
         if not admin_user:
-            logger.info("Creating default administrator account: admin@sap.com")
+            logger.info("Creating default administrator account: admin")
             default_admin = User(
-                email="admin@sap.com",
-                hashed_password=get_password_hash("adminpassword"),
+                email="admin",
+                hashed_password=get_password_hash("admin"),
                 full_name="SAP Admin Manager",
                 role="Super Admin",
                 is_active=True

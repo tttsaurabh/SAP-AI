@@ -6,7 +6,7 @@ import { api, getAuthToken, getUserRole, getUserEmail, clearAuthToken, Message, 
 import { 
   MessageSquare, Plus, LogOut, Send, Bot, User as UserIcon, BookOpen, 
   Settings, ThumbsUp, ThumbsDown, Copy, Download, Moon, Sun, 
-  ChevronRight, RefreshCw, X, FileText, Check, Terminal
+  ChevronRight, RefreshCw, X, FileText, Check, Terminal, Database
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
@@ -315,7 +315,7 @@ export default function ChatPage() {
         )}
 
         {/* New Chat Button */}
-        <div className="p-4">
+        <div className="p-4 pb-2">
           <button
             onClick={handleCreateChat}
             className="flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-purple-600/90 to-blue-600/95 py-3 text-sm font-semibold text-white shadow-md shadow-purple-600/10 transition-all hover:opacity-95 active:scale-95"
@@ -324,6 +324,19 @@ export default function ChatPage() {
             <span>New Consultation</span>
           </button>
         </div>
+
+        {/* Knowledge Base Admin Button for Admin */}
+        {isAdminOrManager && (
+          <div className="px-4 pb-4">
+            <button
+              onClick={() => router.push("/admin")}
+              className="flex w-full items-center justify-center gap-2 rounded-xl border border-purple-500/25 bg-purple-500/5 hover:bg-purple-500/10 py-2.5 text-xs font-semibold text-purple-300 transition-all active:scale-95"
+            >
+              <Database className="h-4 w-4 text-purple-400" />
+              <span>Upload Knowledge Source</span>
+            </button>
+          </div>
+        )}
 
         {/* Chat History List */}
         <div className="flex-1 overflow-y-auto px-3 space-y-1">

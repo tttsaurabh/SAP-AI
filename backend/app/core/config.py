@@ -32,6 +32,14 @@ class Settings(BaseSettings):
     RERANK_ENABLED: bool = False
     RERANK_MODEL: str = ""
     
+    # Vector DB Backend
+    VECTOR_DB_BACKEND: str = "pinecone"  # "pinecone" or "qdrant"
+    PINECONE_API_KEY: str = ""
+    PINECONE_INDEX_NAME: str = "sap-knowledge"
+    
+    # PDF Parser Engine
+    PDF_PARSER_ENGINE: str = "pymupdf"  # "pymupdf" or "unlimited_ocr"
+    
     class Config:
         env_file = ".env"
         extra = "ignore"

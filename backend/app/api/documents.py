@@ -11,7 +11,7 @@ from app.models.models import User, Document, Chunk
 from app.schemas.schemas import DocumentResponse
 from app.services.parser import DocumentParser
 from app.services.chunker import DocumentChunker
-from app.services.vector_db import VectorDBService
+from app.services.vector_db import get_vector_backend
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 
@@ -83,8 +83,9 @@ async def upload_document(
             db_chunks.append(chunk_obj)
         db.commit()
         
-        # 5. Insert in Vector Database
-        VectorDBService.upsert_chunks(
+        # 5. Insert in Vector Database (Pinecone or Qdrant based on config)
+        vector_backend = get_vector_backend()
+        vector_backend.upsert_chunks(
             collection_name=collection_name,
             document_id=db_doc.id,
             filename=file.filename,
@@ -125,8 +126,9 @@ def delete_document(
         except Exception as e:
             logger.warning(f"Could not remove local file {doc.file_path}: {str(e)}")
             
-    # Delete from Qdrant
-    VectorDBService.delete_document_vectors(doc.collection_name, doc.id)
+    # Delete from Vector DB (Pinecone or Qdrant based on config)
+    vector_backend = get_vector_backend()
+    vector_backend.delete_document_vectors(doc.collection_name, doc.id)
     
     # Delete from SQL (cascades to Chunks table)
     db.delete(doc)

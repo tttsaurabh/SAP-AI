@@ -6,6 +6,19 @@ from loguru import logger
 from app.core.config import settings
 from app.services.embeddings import EmbeddingsService
 
+
+def get_vector_backend():
+    """
+    Returns the active vector DB service based on VECTOR_DB_BACKEND setting.
+    Supports 'pinecone' or 'qdrant' (default fallback).
+    """
+    backend = settings.VECTOR_DB_BACKEND.lower()
+    if backend == "pinecone":
+        from app.services.pinecone_db import PineconeDBService
+        return PineconeDBService
+    return VectorDBService
+
+
 class VectorDBService:
     _client = None
 
@@ -115,15 +128,15 @@ class VectorDBService:
             )
             
         try:
-            response = client.query_points(
+            response = client.search(
                 collection_name=collection_name,
-                query=query_vector,
+                query_vector=query_vector,
                 query_filter=q_filter,
                 limit=limit
             )
             
             search_hits = []
-            for hit in response.points:
+            for hit in response:
                 payload = hit.payload
                 search_hits.append({
                     "score": hit.score,

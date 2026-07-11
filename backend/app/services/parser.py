@@ -1,9 +1,11 @@
 import os
 import io
 import csv
+import shutil
 import pandas as pd
 from typing import Dict, Any, List, Tuple
 from loguru import logger
+from app.core.config import settings
 
 # Import document parsing libraries with fallback wrappers
 try:
@@ -39,6 +41,8 @@ class DocumentParser:
         logger.info(f"Parsing file {filename} with extension {ext}")
         
         if ext == ".pdf":
+            if settings.PDF_PARSER_ENGINE == "unlimited_ocr":
+                return DocumentParser._parse_pdf_unlimited_ocr(file_path)
             return DocumentParser._parse_pdf(file_path)
         elif ext in [".docx", ".doc"]:
             return DocumentParser._parse_docx(file_path)
@@ -68,13 +72,16 @@ class DocumentParser:
                     text = page.get_text("text") or ""
                     # Check if we should try OCR for scanned/empty pages
                     if len(text.strip()) < 50 and pytesseract and Image:
-                        # Try OCR
-                        pix = page.get_pixmap()
-                        img_data = pix.tobytes("png")
-                        img = Image.open(io.BytesIO(img_data))
-                        ocr_text = pytesseract.image_to_string(img)
-                        if len(ocr_text.strip()) > len(text.strip()):
-                            text = ocr_text
+                        # Try OCR, but wrap in try-except so OCR unavailability doesn't fail the whole document
+                        try:
+                            pix = page.get_pixmap()
+                            img_data = pix.tobytes("png")
+                            img = Image.open(io.BytesIO(img_data))
+                            ocr_text = pytesseract.image_to_string(img)
+                            if len(ocr_text.strip()) > len(text.strip()):
+                                text = ocr_text
+                        except Exception as ocr_e:
+                            logger.debug(f"OCR failed for page {page_idx + 1}: {str(ocr_e)}")
                     
                     pages.append({
                         "page": page_idx + 1,
@@ -255,3 +262,125 @@ class DocumentParser:
             elif line.isupper() and 3 < len(line) < 100:
                 headings.append(line)
         return headings[:15] # Cap headings at 15 per page for metadata size
+
+    @staticmethod
+    def _parse_pdf_unlimited_ocr(file_path: str) -> List[Dict[str, Any]]:
+        """
+        Parses a PDF using Baidu's Unlimited-OCR transformer model.
+        1. Render PDF pages as images in a temporary folder.
+        2. Load tokenizer and AutoModel from 'baidu/Unlimited-OCR'.
+        3. Run inference via model.infer for each page image.
+        4. Return pages with parsed markdown text.
+        """
+        import tempfile
+        from PIL import Image
+        
+        logger.info(f"Initiating Baidu Unlimited-OCR parsing for {file_path}")
+        
+        # Ensure PyMuPDF is available to render pages to images
+        if not fitz:
+            raise ImportError("PyMuPDF is required to render PDF pages as images for Unlimited-OCR. Please install pymupdf.")
+            
+        try:
+            import torch
+            from transformers import AutoModel, AutoTokenizer
+        except ImportError:
+            raise ImportError("PyTorch and Transformers are required for Baidu Unlimited-OCR. Please install torch and transformers.")
+            
+        doc = fitz.open(file_path)
+        pages_count = len(doc)
+        
+        # Render pages to temporary PNG images
+        temp_dir = tempfile.mkdtemp()
+        image_paths = []
+        try:
+            for page_idx in range(pages_count):
+                page = doc[page_idx]
+                pix = page.get_pixmap(dpi=150) # render with reasonable resolution
+                img_path = os.path.join(temp_dir, f"page_{page_idx}.png")
+                pix.save(img_path)
+                image_paths.append(img_path)
+                
+            logger.info(f"Rendered {pages_count} pages as images for OCR in: {temp_dir}")
+            
+            # Load Baidu Unlimited-OCR model
+            model_name = 'baidu/Unlimited-OCR'
+            logger.info(f"Loading {model_name} model and tokenizer...")
+            tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+            
+            # Use GPU if available, else fallback to CPU
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+            
+            model = AutoModel.from_pretrained(
+                model_name, 
+                trust_remote_code=True, 
+                use_safetensors=True, 
+                torch_dtype=dtype
+            ).eval().to(device)
+            
+            logger.info(f"Baidu Unlimited-OCR model loaded successfully on device: {device}")
+            
+            pages_data = []
+            
+            # Page-by-page inference for detailed per-page tracking
+            for page_idx, img_path in enumerate(image_paths):
+                logger.info(f"OCR processing page {page_idx + 1}/{pages_count}...")
+                
+                # Single page inference config: base mode
+                out_dir = os.path.join(temp_dir, f"output_{page_idx}")
+                os.makedirs(out_dir, exist_ok=True)
+                
+                # The model's custom infer method writes prediction to a text file
+                model.infer(
+                    tokenizer,
+                    prompt='<image>document parsing.',
+                    image_file=img_path,
+                    output_path=out_dir,
+                    base_size=1024,
+                    image_size=1024,
+                    crop_mode=False,
+                    max_length=32768,
+                    save_results=True
+                )
+                
+                # Read the generated result from output path
+                page_text = ""
+                if os.path.exists(out_dir):
+                    out_files = os.listdir(out_dir)
+                    for f_name in out_files:
+                        if f_name.endswith(".txt"):
+                            with open(os.path.join(out_dir, f_name), "r", encoding="utf-8") as f_ref:
+                                page_text = f_ref.read()
+                                break
+                            
+                # Fallback prediction description if file wasn't written
+                if not page_text:
+                    logger.warning(f"No text output file generated by Unlimited-OCR for page {page_idx + 1}")
+                    page_text = f"[Baidu Unlimited-OCR could not extract text from page {page_idx + 1}]"
+                    
+                pages_data.append({
+                    "page": page_idx + 1,
+                    "text": page_text,
+                    "metadata": {
+                        "source_type": "pdf",
+                        "engine": "baidu_unlimited_ocr",
+                        "headings": DocumentParser._extract_headings_from_text(page_text)
+                    }
+                })
+                
+            return pages_data
+            
+        except Exception as e:
+            logger.error(f"Baidu Unlimited-OCR parsing failed: {str(e)}")
+            raise e
+            
+        finally:
+            # Clean up temp folder and images
+            doc.close()
+            try:
+                shutil.rmtree(temp_dir)
+                logger.info(f"Cleaned up temporary OCR images from: {temp_dir}")
+            except Exception as clean_err:
+                logger.warning(f"Failed to clean up temp OCR folder: {str(clean_err)}")
+

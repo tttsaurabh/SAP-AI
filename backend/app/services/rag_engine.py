@@ -4,7 +4,7 @@ from loguru import logger
 from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models.models import Chunk, Document
-from app.services.vector_db import VectorDBService
+from app.services.vector_db import get_vector_backend
 
 # Import SDKs with fallback
 try:
@@ -24,22 +24,54 @@ except ImportError:
 
 class RAGEngine:
     @staticmethod
+    def expand_query(query: str) -> str:
+        """
+        Expands typical SAP abbreviations to support hybrid keyword and semantic retrieval.
+        """
+        sap_abbreviations = {
+            r"\bBP\b": "Business Partner",
+            r"\bCR\b": "Change Request",
+            r"\bMM\b": "Material Master",
+            r"\bBAPI\b": "Business Application Programming Interface",
+            r"\bMDG\b": "Master Data Governance",
+            r"\bRAP\b": "RESTful Application Programming",
+            r"\bCDS\b": "Core Data Services",
+            r"\bFPM\b": "Floorplan Manager",
+            r"\bBRF\+?\b": "Business Rules Framework plus",
+            r"\bADT\b": "ABAP Development Tools",
+            r"\bBADI\b": "Business Add-In",
+            r"\bALV\b": "ABAP List Viewer",
+            r"\bDDIC\b": "Data Dictionary",
+        }
+        expanded = query
+        for pattern, expansion in sap_abbreviations.items():
+            if re.search(pattern, query, re.IGNORECASE):
+                if expansion.lower() not in query.lower():
+                    expanded += f" {expansion}"
+        return expanded
+
+    @staticmethod
     def hybrid_search(db: Session, collection_name: str, query: str, limit: int = 5) -> List[Dict[str, Any]]:
         """
         Retrieves relevant document chunks using hybrid search:
-        1. Dense vector search in Qdrant.
-        2. Database keyword search (SQL ILIKE).
-        Combines results using Reciprocal Rank Fusion (RRF).
+        1. Query expansion for SAP abbreviations.
+        2. Dense vector search in Qdrant.
+        3. Database keyword search (SQL ILIKE).
+        4. Combines results using Reciprocal Rank Fusion (RRF).
+        5. Context compression (deduplication).
         """
-        logger.info(f"Executing hybrid search in collection '{collection_name}' for query: '{query}'")
+        # 1. Query Expansion
+        expanded_query = RAGEngine.expand_query(query)
+        logger.info(f"Executing hybrid search for query: '{query}' (Expanded: '{expanded_query}')")
         
-        # 1. Semantic Search
-        semantic_results = VectorDBService.search_similarity(collection_name, query, limit=limit * 2)
+        # 2. Semantic Search using expanded query (routed to Pinecone or Qdrant)
+        vector_backend = get_vector_backend()
+        semantic_results = vector_backend.search_similarity(collection_name, expanded_query, limit=limit * 3)
         
-        # 2. Database Keyword Search
-        keyword_results = RAGEngine._db_keyword_search(db, collection_name, query, limit=limit * 2)
+        # 3. Database Keyword Search using expanded query
+        keyword_results = RAGEngine._db_keyword_search(db, collection_name, expanded_query, limit=limit * 3)
         
-        # 3. Reciprocal Rank Fusion (RRF)
+        # 4. Reciprocal Rank Fusion (RRF)
         # RRF formula: RRF_score = sum(1 / (k + rank)) where k = 60
         rrf_scores: Dict[Tuple[int, int], Dict[str, Any]] = {} # keyed by (document_id, chunk_index)
         k = 60
@@ -80,11 +112,21 @@ class RAGEngine:
                 }
             rrf_scores[key]["score"] += 1.0 / (k + rank + 1)
             
-        # Sort and limit
+        # 5. Sort and Deduplicate / Compress
         sorted_hits = sorted(rrf_scores.values(), key=lambda x: x["score"], reverse=True)
-        final_results = [hit["chunk"] for hit in sorted_hits[:limit]]
         
-        logger.info(f"Hybrid search returned {len(final_results)} fused results")
+        seen_texts = set()
+        final_results = []
+        for hit in sorted_hits:
+            chunk = hit["chunk"]
+            norm_text = re.sub(r'\s+', ' ', chunk["text"]).strip().lower()
+            if len(norm_text) >= 20 and norm_text not in seen_texts:
+                seen_texts.add(norm_text)
+                final_results.append(chunk)
+                if len(final_results) >= limit:
+                    break
+        
+        logger.info(f"Hybrid search returned {len(final_results)} fused and compressed results")
         return final_results
 
     @staticmethod
@@ -168,7 +210,7 @@ ASSISTANT RESPONSE:"""
             if genai:
                 try:
                     genai.configure(api_key=settings.GEMINI_API_KEY)
-                    model = genai.GenerativeModel('gemini-1.5-flash')
+                    model = genai.GenerativeModel('gemini-3.5-flash')
                     response = model.generate_content(prompt)
                     response_text = response.text
                 except Exception as e:

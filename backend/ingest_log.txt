@@ -1,0 +1,11 @@
+[DONE] Enable Dynamic Parallel Approval for Company Code Data in Rule-based Workflow.pdf → 15 pages, 15 chunks in 20.9s
+[DONE] MDG100.pdf → 1017 pages, 1017 chunks in 172.8s
+[DONE] MDG101.pdf → 148 pages, 148 chunks in 8.7s
+[DONE] MDG102(1).pdf → 186 pages, 186 chunks in 19.0s
+[DONE] Multi Processing with SAP MDG.pdf → 40 pages, 40 chunks in 10.2s
+[DONE] SAP How-To Guide Extend MDG-S _ MDG-C Data Model by a New Entity Type (flex option).pdf → 54 pages, 54 chunks in 10.8s
+[DONE] SAP How-To Guide_ Extend the MDG Business Partner - Overview.pdf → 37 pages, 37 chunks in 5.7s
+[DONE] SAP How-To Guide_ Extend the MDG Business Partner-Node Extension (Reuse Option).pdf → 65 pages, 65 chunks in 20.6s
+[DONE] SAP How-To Guide_ Extend the MDG M with new attributes.pdf → 16 pages, 16 chunks in 5.8s
+[DONE] SAP MDG Master Data Governance The Comprehensive Guide.pdf → 1234 pages, 1227 chunks in 209.8s
+[DONE] enhancing-change-request-inbox-with-additional-columns.pdf → 8 pages, 8 chunks in 3.2s

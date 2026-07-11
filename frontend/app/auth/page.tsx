@@ -109,17 +109,17 @@ export default function AuthPage() {
             )}
 
             <div className="space-y-1">
-              <label className="text-xs font-semibold text-slate-400">Email Address</label>
+              <label className="text-xs font-semibold text-slate-400">User ID / Email</label>
               <div className="relative rounded-xl shadow-sm">
                 <div className="absolute inset-y-0 left-0 flex items-center pl-3.5 pointer-events-none">
                   <Mail className="h-4 w-4 text-slate-500" />
                 </div>
                 <input
-                  type="email"
+                  type="text"
                   required
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
-                  placeholder="name@sap.com"
+                  placeholder="Enter user ID or email"
                   className="block w-full rounded-xl bg-slate-950/65 border border-slate-800/80 py-3 pl-10 pr-4 text-sm text-white placeholder-slate-500 transition-all focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500"
                 />
               </div>
@@ -190,7 +190,7 @@ export default function AuthPage() {
         {/* Development Helper Quick login hints */}
         <div className="rounded-xl border border-slate-800 bg-slate-900/40 p-4 text-center text-xs text-slate-500">
           <p className="font-semibold text-slate-400 mb-1">Development Quick Sign-in Credentials</p>
-          <p>Admin Profile: <code className="text-purple-400">admin@sap.com</code> / <code className="text-purple-400">adminpassword</code></p>
+          <p>Admin Profile: <code className="text-purple-400">admin</code> / <code className="text-purple-400">admin</code></p>
           <p>Consultant Profile: <code className="text-blue-400">consultant@sap.com</code> / <code className="text-blue-400">consultantpassword</code></p>
         </div>
       </div>

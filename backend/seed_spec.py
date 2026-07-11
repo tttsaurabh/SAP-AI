@@ -12,7 +12,6 @@ from app.services.chunker import DocumentChunker
 from app.services.vector_db import VectorDBService
 
 def seed_specification():
-    source_file_path = r"C:\Users\tttsa\.gemini\antigravity-ide\brain\e2854cfe-db8a-4ac1-a90a-4442b6c941cb\.system_generated\steps\7\content.md"
     target_dir = "./uploads"
     target_filename = "sap_governance_spec.txt"
     target_file_path = os.path.join(target_dir, target_filename)
@@ -21,18 +20,9 @@ def seed_specification():
     # Ensure uploads directory exists
     os.makedirs(target_dir, exist_ok=True)
 
-    # 1. Read from system download path and write to uploads
-    if not os.path.exists(source_file_path):
-        print(f"Source file not found at {source_file_path}")
+    if not os.path.exists(target_file_path):
+        print(f"Target specification file not found at {target_file_path}")
         return
-
-    with open(source_file_path, "r", encoding="utf-8", errors="ignore") as src:
-        content = src.read()
-
-    with open(target_file_path, "w", encoding="utf-8") as tgt:
-        tgt.write(content)
-
-    print(f"Copied specification document to {target_file_path}")
 
     # 2. Database Session setup
     Base.metadata.create_all(bind=engine)
