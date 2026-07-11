@@ -5,8 +5,8 @@ from typing import List, Dict, Any
 
 from app.core.database import get_db
 from app.core.security import admin_only
-from app.models.models import User, Document, Chunk, Conversation, Message, Feedback
-from app.schemas.schemas import DocumentAnalytics, ConversationAnalytics, ChunkResponse
+from app.models.models import User, Document, Chunk, Conversation, Message, Feedback, Collection
+from app.schemas.schemas import DocumentAnalytics, ConversationAnalytics, ChunkResponse, CollectionResponse
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -15,12 +15,30 @@ def list_collections(
     db: Session = Depends(get_db),
     current_user: User = Depends(admin_only)
 ):
+    """
+    Backward-compatible endpoint: returns distinct collection names as bare
+    strings (this is what the frontend collection picker currently expects
+    -- see frontend/lib/api.ts's listCollections()). Kept as-is on purpose;
+    full frontend wiring to Collection.id is deferred (see CLAUDE.md).
+    """
     # Fetch distinct collection names from documents table
     results = db.query(Document.collection_name).distinct().all()
     collections = [r[0] for r in results]
     if "Default" not in collections:
         collections.append("Default")
     return collections
+
+@router.get("/collections/full", response_model=List[CollectionResponse])
+def list_collections_full(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(admin_only)
+):
+    """
+    Returns the real Collection rows (id, name, embedding_model, etc.) now
+    that collections are a first-class table. Additive endpoint -- does not
+    replace /collections, which the frontend still consumes as List[str].
+    """
+    return db.query(Collection).order_by(Collection.name.asc()).all()
 
 @router.get("/analytics/documents", response_model=DocumentAnalytics)
 def get_document_analytics(

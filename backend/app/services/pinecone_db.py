@@ -91,7 +91,10 @@ class PineconeDBService:
 
         vectors = []
         for i, chunk in enumerate(chunks):
-            vector_id = f"doc{document_id}_chunk{chunk['chunk_index']}"
+            # vector_id is generated once upstream (app/api/documents.py upload flow) and reused
+            # here and on the Chunk.vector_id column -- this backend does not derive its own id
+            # formula. Fall back to the historical formula only for callers that don't supply one.
+            vector_id = chunk.get("vector_id") or f"doc{document_id}_chunk{chunk['chunk_index']}"
             metadata = {
                 "document_id": document_id,
                 "filename": filename,

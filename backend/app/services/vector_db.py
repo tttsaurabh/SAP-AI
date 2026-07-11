@@ -1,3 +1,4 @@
+import uuid
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 from qdrant_client.http.exceptions import UnexpectedResponse
@@ -5,6 +6,13 @@ from typing import List, Dict, Any, Optional
 from loguru import logger
 from app.core.config import settings
 from app.services.embeddings import EmbeddingsService
+
+# Fixed namespace used to deterministically derive Qdrant-compatible UUID
+# point ids from the canonical `vector_id` string (Qdrant only accepts
+# unsigned ints or UUID strings as point ids, unlike Pinecone which accepts
+# arbitrary strings) -- the canonical id itself is still generated in exactly
+# one place (app/api/documents.py upload flow).
+_QDRANT_ID_NAMESPACE = uuid.UUID("6f9cf37c-3b0a-4c1e-9a9e-3b6a9d9d8f4a")
 
 
 def get_vector_backend():
@@ -34,9 +42,16 @@ class VectorDBService:
                 cls._client = client
                 logger.info("Connected to remote Qdrant container successfully.")
             except Exception as e:
-                logger.warning(f"Failed to connect to remote Qdrant ({str(e)}). Falling back to local in-memory Qdrant instance.")
-                # Local memory fallback client
-                cls._client = QdrantClient(location=":memory:")
+                # NOTE: previously this silently fell back to an in-memory
+                # (":memory:") Qdrant instance, which meant a misconfigured or
+                # unreachable Qdrant host would appear to "work" while
+                # actually storing vectors nowhere durable and losing them on
+                # restart. Fail loudly instead.
+                logger.error(f"Failed to connect to Qdrant at {settings.QDRANT_HOST}:{settings.QDRANT_PORT}: {str(e)}")
+                raise RuntimeError(
+                    f"Qdrant unreachable at {settings.QDRANT_HOST}:{settings.QDRANT_PORT} — "
+                    f"check the Qdrant service is running"
+                ) from e
         return cls._client
 
     @classmethod
@@ -68,15 +83,21 @@ class VectorDBService:
         
         points = []
         for idx, chunk in enumerate(chunks):
-            # Qdrant requires points containing id (int/uuid), vector (list[float]), payload (dict)
-            point_id = document_id * 100000 + chunk["chunk_index"]
+            # vector_id is generated once upstream (app/api/documents.py upload flow) and reused
+            # here and on the Chunk.vector_id column -- this backend does not derive its own id
+            # formula. Qdrant point ids must be an unsigned int or a UUID string though, so we
+            # deterministically derive a UUID from the canonical vector_id for the point id itself
+            # and keep the canonical string in the payload for lookups/debugging.
+            vector_id = chunk.get("vector_id") or f"doc{document_id}_chunk{chunk['chunk_index']}"
+            point_id = str(uuid.uuid5(_QDRANT_ID_NAMESPACE, vector_id))
             payload = {
                 "document_id": document_id,
                 "filename": filename,
                 "text": chunk["text"],
                 "page_number": chunk.get("page_number", 1),
                 "section_header": chunk.get("section_header", ""),
-                "collection_name": collection_name
+                "collection_name": collection_name,
+                "vector_id": vector_id
             }
             points.append(
                 qmodels.PointStruct(

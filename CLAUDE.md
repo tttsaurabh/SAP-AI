@@ -121,3 +121,153 @@ policy.
   security work" above; no live database was available to run the migration
   against in this environment, so `alembic upgrade head` has only been
   verified against sqlite, not Postgres.
+
+### 2026-07-12 — Phase 1: Schema hardening
+
+Non-security schema-hardening pass following the architecture review. All
+changes verified against a scratch SQLite DB (`alembic upgrade head` /
+`downgrade base`, plus an ORM round-trip script exercising the new enum
+columns and Collection/Chunk fields) — no live Postgres was available in
+this environment, so Postgres-specific paths (native `CREATE TYPE`/`ALTER
+... USING`) are written carefully but not live-tested. `fastapi` itself
+isn't installed in this sandbox, so `app.main` / the HTTP layer couldn't be
+booted end-to-end; verification instead went through `SessionLocal` +
+the ORM models directly, and `backend/tests/test_basic.py` (3/3 pass via
+`python -m unittest`, `pytest` not installed here).
+
+**1. Missing FK indexes** (`backend/app/models/models.py`): added
+`index=True` to `Chunk.document_id`, `Conversation.user_id`,
+`Message.conversation_id`, `Feedback.message_id`.
+
+**2. Collections as a first-class table**:
+- New `Collection` model (`id`, `name` unique+indexed, `created_by` FK to
+  `users.id`, `created_at`, plus `embedding_model`/`embedding_version` — see
+  item 3) in `backend/app/models/models.py`.
+- `Document.collection_id` (FK to `collections.id`, nullable) added
+  alongside the existing `Document.collection_name`. **Decision**:
+  `collection_name` is kept as a denormalized display-cache column for this
+  phase rather than dropped, to avoid a bigger breaking change to the
+  upload/list/search API surface (it's still what `vector_db.py` /
+  `pinecone_db.py` use as the namespace/collection key, and what the
+  frontend collection picker reads). `collection_id`/`Collection` is the
+  source of truth for embedding-model bookkeeping. Documented in a comment
+  on `Document.collection_name` in `models.py`. Follow-up for a later phase:
+  fully migrate collection lookups to `collection_id` and drop
+  `collection_name`, and switch the vector store namespace key to
+  `collection_id` instead of the (renameable) name string.
+- `backend/app/api/documents.py`'s upload flow now does get-or-create by
+  name (`_get_or_create_collection`) and sets `Document.collection_id`.
+- `backend/app/api/admin.py`: existing `GET /api/admin/collections` is
+  unchanged in shape (`List[str]`, backward compatible with
+  `frontend/lib/api.ts`'s `listCollections()` and its callers in
+  `admin/page.tsx` / `chat/page.tsx`) — kept deliberately minimal per the
+  task's fallback option, since a full frontend refactor to `{id, name}`
+  objects was out of scope for this pass. Added a new, additive
+  `GET /api/admin/collections/full` endpoint returning real `Collection`
+  rows (`CollectionResponse` schema in `schemas.py`) for future frontend
+  wiring. **Follow-up**: wire the frontend collection picker to
+  `collections/full` + `collection_id` in a later phase.
+- Alembic migration `backend/alembic/versions/9ff13957a9db_phase1_schema_hardening.py`
+  creates the `collections` table and `documents.collection_id`, then runs
+  raw-SQL backfill (`op.execute`): inserts distinct `collection_name` values
+  into `collections`, then sets `documents.collection_id` to match.
+  Verified the backfill against seeded data in scratch SQLite.
+
+**3. Embedding/vector-store integrity fixes**:
+- Fixed `EmbeddingsService.get_embedding_dimension()` in
+  `backend/app/services/embeddings.py`: `text-embedding-3-large` now
+  correctly maps to `3072` (was `3074`).
+- `Collection.embedding_model` is stamped with `settings.EMBEDDING_MODEL` at
+  get-or-create time (first ingest into that collection name). Before every
+  upload, `documents.py`'s `_ensure_embedding_model_compatible` compares the
+  collection's stored `embedding_model` against the currently configured
+  one and raises `HTTPException(409, ...)` on mismatch instead of silently
+  mixing embedding spaces in one vector index/namespace.
+  `Collection.embedding_version` exists as a column but nothing sets it yet
+  (no versioning scheme exists for any single `EMBEDDING_MODEL` value today)
+  — left `None`/unused, follow-up for whenever model versioning is
+  introduced.
+- Added `Chunk.vector_id` (String, nullable). The vector id
+  (`f"doc{document_id}_chunk{chunk_index}"`) is now generated exactly once,
+  in `backend/app/api/documents.py`'s upload flow, and passed into both
+  `Chunk(vector_id=...)` and the chunk dicts handed to
+  `vector_backend.upsert_chunks(...)`. `vector_db.py` (Qdrant) and
+  `pinecone_db.py` both now read `chunk.get("vector_id")` instead of
+  deriving their own formula (each keeps a `... or f"doc{...}_chunk{...}"`
+  fallback for any caller that doesn't supply one, e.g. direct test calls).
+  Note: Qdrant point ids must be an unsigned int or UUID string (unlike
+  Pinecone, which accepts arbitrary strings), so `vector_db.py` derives a
+  deterministic `uuid5` from the canonical `vector_id` string for the actual
+  Qdrant point id, and stores the canonical string in the point's payload
+  under `vector_id` for lookups/debugging — the id is still only *generated*
+  in one place, just adapted for Qdrant's id-type constraint at the point of
+  use.
+- Removed the silent Qdrant `QdrantClient(location=":memory:")` fallback in
+  `VectorDBService.get_client()` (`backend/app/services/vector_db.py`) — an
+  unreachable/misconfigured Qdrant host now raises
+  `RuntimeError("Qdrant unreachable at {host}:{port} — check the Qdrant
+  service is running")` instead of silently switching to an in-memory
+  instance that loses data on restart.
+
+**4. Enum-ified role/status columns**:
+- New `backend/app/core/roles.py`: `Role` (`SUPER_ADMIN = "Super Admin"`,
+  `KNOWLEDGE_MANAGER = "SAP Knowledge Manager"`, `CONSULTANT = "SAP
+  Consultant"`, `END_USER = "End User"`, `GUEST = "Guest"`),
+  `DocumentStatus` (`PROCESSING = "processing"`, `ACTIVE = "active"`,
+  `FAILED = "failed"`), `MessageRole` (`USER = "user"`, `ASSISTANT =
+  "assistant"`) — all `str, enum.Enum`, values verified by grep against
+  existing string literals before creating the file (no new/renamed role or
+  status values).
+- `User.role`, `Document.status`, `Message.role` in `models.py` now use
+  `sqlalchemy.Enum` bound to these Python enums (`values_callable` set so
+  the DB stores the `.value` strings, not the Python member names). On
+  Postgres this becomes a real native `ENUM` type with a `CHECK`-equivalent
+  constraint; on SQLite (no native enum support) it stays a plain
+  `VARCHAR` (SQLAlchemy's `Enum` defaults `create_constraint=False`, so no
+  `CHECK` is added there — confirmed this matches actual SQLAlchemy 2.0
+  behavior, not a bug).
+- Alembic migration converts the three columns via
+  `sa.Enum(...).create(bind, checkfirst=True)` (dialect-aware: emits
+  `CREATE TYPE` on Postgres, no-op on SQLite) + `batch_alter_table(...)`
+  with `postgresql_using` for the Postgres cast (batch mode is required so
+  the same migration also works on SQLite, which can't `ALTER COLUMN`
+  directly). Downgrade drops the columns back to `String` and drops the
+  enum types. Enum values are hardcoded inline in the migration file
+  (not imported from `app.core.roles`) so the migration stays
+  self-contained/immune to future edits of that module, per Alembic
+  best practice.
+- Updated every string-literal role comparison to use the `Role` enum:
+  `backend/app/core/security.py` (`RoleChecker`, `admin_only`,
+  `consultant_or_above`, `any_authenticated` — **committed in isolation**,
+  see commit list below, purely mechanical literal→enum swap, zero
+  authorization-behavior change), `backend/app/api/chat.py` (conversation
+  ownership checks + `Message(role=...)` construction, now via
+  `MessageRole`), `backend/app/main.py` (seeded default-user roles).
+  `backend/app/api/auth.py` was deliberately **not touched** — its
+  registration endpoint still assigns `role=user_in.role` (a plain string
+  from the client) directly to the enum column; verified via an ORM
+  round-trip script that SQLAlchemy's `Enum` type accepts a plain string
+  matching a valid value and returns the correct enum member on read-back,
+  so this continues to work unchanged. The client-controlled-role-at-
+  registration issue itself remains explicitly out of scope (security
+  remediation, deferred — see "Deferred security work" above).
+  `UserCreate.role` in `schemas.py` stays `Optional[str]` (unchanged) per
+  the task's instruction to keep input validation permissive in this phase.
+
+**Commits** (see git log): (a) `backend/app/core/security.py` role-literal
+enum swap, isolated; (b) everything else in this phase.
+
+**Follow-ups for later phases**:
+- Frontend collection picker still consumes `List[str]` from
+  `/api/admin/collections`; wire it to `/api/admin/collections/full` +
+  `Collection.id` when a full frontend pass is scheduled.
+- Drop `Document.collection_name` once all read paths (vector store
+  namespace key, frontend) are migrated to `collection_id`.
+- `Collection.embedding_version` is unused (no model-versioning scheme
+  exists yet).
+- Postgres-specific migration paths (native ENUM creation/cast) are
+  unverified against a live Postgres instance — re-verify before deploying
+  this migration to a real Postgres environment.
+- `fastapi` is not installed in this sandbox; the HTTP/router layer
+  (`app.main`, `TestClient`-style tests) could not be exercised end-to-end
+  here, only the ORM/model/migration layer.

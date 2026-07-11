@@ -9,6 +9,7 @@ from loguru import logger
 from app.core.config import settings
 from app.core.database import SessionLocal
 from app.core.security import get_password_hash
+from app.core.roles import Role
 from app.models.models import User
 from app.api import auth, documents, chat, admin, sap_agentic
 
@@ -34,7 +35,7 @@ try:
                 email="admin",
                 hashed_password=get_password_hash("admin"),
                 full_name="SAP Admin Manager",
-                role="Super Admin",
+                role=Role.SUPER_ADMIN,
                 is_active=True
             )
             db.add(default_admin)
@@ -44,7 +45,7 @@ try:
                 email="consultant@sap.com",
                 hashed_password=get_password_hash("consultantpassword"),
                 full_name="SAP Consultant User",
-                role="SAP Consultant",
+                role=Role.CONSULTANT,
                 is_active=True
             )
             db.add(default_user)

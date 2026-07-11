@@ -29,7 +29,7 @@ class EmbeddingsService:
         model_setting = settings.EMBEDDING_MODEL
         if model_setting.startswith("openai:"):
             if "large" in model_setting:
-                return 3074
+                return 3072
             return 1536
         elif model_setting.startswith("gemini:"):
             return 768

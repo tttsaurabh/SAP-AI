@@ -42,6 +42,7 @@ class DocumentResponse(BaseModel):
     file_path: str
     file_size: int
     collection_name: str
+    collection_id: Optional[int] = None
     document_type: Optional[str]
     status: str
     total_chunks: int
@@ -58,6 +59,18 @@ class ChunkResponse(BaseModel):
     page_number: Optional[int]
     section_header: Optional[str]
     chunk_metadata: Dict[str, Any]
+
+    class Config:
+        from_attributes = True
+
+# --- Collection Schemas ---
+class CollectionResponse(BaseModel):
+    id: int
+    name: str
+    created_by: Optional[int] = None
+    created_at: datetime
+    embedding_model: Optional[str] = None
+    embedding_version: Optional[str] = None
 
     class Config:
         from_attributes = True

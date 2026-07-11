@@ -8,6 +8,7 @@ from typing import List, Dict, Any
 
 from app.core.database import get_db
 from app.core.security import any_authenticated
+from app.core.roles import Role, MessageRole
 from app.models.models import User, Conversation, Message, Feedback
 from app.schemas.schemas import ConversationResponse, ConversationDetail, MessageResponse, FeedbackCreate, FeedbackResponse
 from app.services.rag_engine import RAGEngine
@@ -42,7 +43,7 @@ def get_conversation_details(
     conv = db.query(Conversation).filter(Conversation.id == conv_id).first()
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    if conv.user_id != current_user.id and current_user.role != "Super Admin":
+    if conv.user_id != current_user.id and current_user.role != Role.SUPER_ADMIN:
         raise HTTPException(status_code=403, detail="Access denied")
     return conv
 
@@ -55,7 +56,7 @@ def delete_conversation(
     conv = db.query(Conversation).filter(Conversation.id == conv_id).first()
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    if conv.user_id != current_user.id and current_user.role != "Super Admin":
+    if conv.user_id != current_user.id and current_user.role != Role.SUPER_ADMIN:
         raise HTTPException(status_code=403, detail="Access denied")
     db.delete(conv)
     db.commit()
@@ -105,7 +106,7 @@ async def stream_chat_response(
         raise HTTPException(status_code=404, detail="Conversation not found")
         
     # Save user message
-    user_msg = Message(conversation_id=conv_id, role="user", content=query, citations=[])
+    user_msg = Message(conversation_id=conv_id, role=MessageRole.USER, content=query, citations=[])
     db.add(user_msg)
     db.commit()
     db.refresh(user_msg)
@@ -133,7 +134,7 @@ async def stream_chat_response(
         # Save assistant message
         assistant_msg = Message(
             conversation_id=conv_id,
-            role="assistant",
+            role=MessageRole.ASSISTANT,
             content=response_text,
             citations=citations
         )
