@@ -158,17 +158,13 @@ class RAGEngine:
         return query_filter.limit(limit).all()
 
     @staticmethod
-    def generate_response(db: Session, collection_name: str, query: str, conversation_history: List[Dict[str, str]] = None) -> Tuple[str, List[Dict[str, Any]]]:
+    def _build_prompt(chunks: List[Dict[str, Any]], conversation_history: List[Dict[str, str]], query: str) -> str:
         """
-        Performs hybrid search, builds RAG context, prompts the LLM, and formats response citations.
+        Builds the RAG prompt from retrieved context chunks + conversation
+        history. Shared by both the non-streaming (`generate_response`) and
+        streaming (`stream_response`) code paths so the prompt text itself
+        never drifts between the two.
         """
-        # Retrieve context chunks
-        chunks = RAGEngine.hybrid_search(db, collection_name, query, limit=5)
-        
-        if not chunks:
-            return "The requested information is not available in the current SAP knowledge base.", []
-            
-        # Create prompt
         context_str = ""
         for i, chunk in enumerate(chunks):
             context_str += f"--- CONTEXT BLOCK {i+1} ---\n"
@@ -176,13 +172,13 @@ class RAGEngine:
             context_str += f"Page Number: {chunk['page_number']}\n"
             context_str += f"Section Header: {chunk['section_header']}\n"
             context_str += f"Content:\n{chunk['text']}\n\n"
-            
+
         history_str = ""
         if conversation_history:
             for turn in conversation_history[-6:]: # Include last 3 turns
                 history_str += f"{turn['role'].upper()}: {turn['content']}\n"
 
-        prompt = f"""You are an expert SAP Knowledge AI Assistant. You must answer the user's question ONLY using the provided context blocks.
+        return f"""You are an expert SAP Knowledge AI Assistant. You must answer the user's question ONLY using the provided context blocks.
 
 KNOWLEDGE BOUNDARY RULES:
 - If the requested information is not explicitly found in the Context Blocks below, respond exactly with: "The requested information is not available in the current SAP knowledge base."
@@ -207,63 +203,32 @@ FORMATTING RULES:
 USER QUESTION: {query}
 ASSISTANT RESPONSE:"""
 
-        # Generate response using LLM
-        response_text = ""
-        
-        # 1. Try Gemini
-        if settings.GEMINI_API_KEY:
-            if genai:
-                try:
-                    genai.configure(api_key=settings.GEMINI_API_KEY)
-                    model = genai.GenerativeModel('gemini-3.5-flash')
-                    response = model.generate_content(prompt)
-                    response_text = response.text
-                except Exception as e:
-                    logger.error(f"Gemini generation failed: {str(e)}")
-            else:
-                logger.warning("google-generativeai module not imported.")
-                
-        # 2. Try OpenAI fallback
-        if not response_text and settings.OPENAI_API_KEY:
-            if OpenAI:
-                try:
-                    client = OpenAI(api_key=settings.OPENAI_API_KEY)
-                    response = client.chat.completions.create(
-                        model="gpt-4o-mini",
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=0.0
-                    )
-                    response_text = response.choices[0].message.content
-                except Exception as e:
-                    logger.error(f"OpenAI generation failed: {str(e)}")
-                    
-        # 3. Try Anthropic fallback
-        if not response_text and settings.ANTHROPIC_API_KEY:
-            if anthropic:
-                try:
-                    client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-                    message = client.messages.create(
-                        model="claude-3-5-sonnet-20240620",
-                        max_tokens=2000,
-                        temperature=0.0,
-                        messages=[{"role": "user", "content": prompt}]
-                    )
-                    response_text = message.content[0].text
-                except Exception as e:
-                    logger.error(f"Anthropic generation failed: {str(e)}")
+    @staticmethod
+    def _mock_fallback_text(chunks: List[Dict[str, Any]]) -> str:
+        """
+        Canned local response used when no LLM API key is configured / every
+        configured provider failed before producing any output. Not a true
+        generative response -- just enough to display retrieved context and
+        point the operator at the missing configuration.
+        """
+        logger.warning("No API keys found. Generating local mocked RAG response.")
+        snippet = chunks[0]["text"][:300] + "..."
+        return (
+            f"Here is the information about your query found in the SAP knowledge documents:\n\n"
+            f"* **Topic Details**: {snippet} [1]\n\n"
+            f"*Please configure an LLM API key (e.g. GEMINI_API_KEY) in backend/.env to get real generative responses.*"
+        )
 
-        # 4. Mock Fallback (for testing / development without active keys)
-        if not response_text:
-            logger.warning("No API keys found. Generating local mocked RAG response.")
-            # Simple keyword matching mockup to display retrieved text
-            snippet = chunks[0]["text"][:300] + "..."
-            response_text = f"Here is the information about your query found in the SAP knowledge documents:\n\n* **Topic Details**: {snippet} [1]\n\n*Please configure an LLM API key (e.g. GEMINI_API_KEY) in backend/.env to get real generative responses.*"
-
-        # Check knowledge boundary violation in response
-        if "information is not available" in response_text.lower() or "not available in the current sap knowledge" in response_text.lower():
-            return "The requested information is not available in the current SAP knowledge base.", []
-
-        # Parse citations
+    @staticmethod
+    def build_citations(response_text: str, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Parses `[N]`-bracket citation markers out of `response_text` and
+        resolves them against the retrieved `chunks` list, returning the
+        same citation dict shape persisted to `Message.citations` (JSON) and
+        the `Citation` join table. Shared by both `generate_response` and
+        `stream_response` so citation parsing/formatting never drifts
+        between the non-streaming and streaming code paths.
+        """
         citations = []
         # Find all brackets like [1], [2], [1][2], etc.
         citation_indices = set(map(int, re.findall(r'\[(\d+)\]', response_text)))
@@ -287,4 +252,223 @@ ASSISTANT RESPONSE:"""
                     "text": citation_text
                 })
 
+        return citations
+
+    @staticmethod
+    def generate_response(db: Session, collection_name: str, query: str, conversation_history: List[Dict[str, str]] = None) -> Tuple[str, List[Dict[str, Any]]]:
+        """
+        Performs hybrid search, builds RAG context, prompts the LLM, and formats response citations.
+
+        Non-streaming path -- generates the *complete* response before
+        returning. Kept around for callers that genuinely want a single
+        blocking call (tests, scripts); the chat SSE endpoint uses
+        `stream_response` instead (see Phase 3 CLAUDE.md entry).
+        """
+        # Retrieve context chunks
+        chunks = RAGEngine.hybrid_search(db, collection_name, query, limit=5)
+
+        if not chunks:
+            return "The requested information is not available in the current SAP knowledge base.", []
+
+        prompt = RAGEngine._build_prompt(chunks, conversation_history, query)
+
+        # Generate response using LLM
+        response_text = ""
+
+        # 1. Try Gemini
+        if settings.GEMINI_API_KEY:
+            if genai:
+                try:
+                    genai.configure(api_key=settings.GEMINI_API_KEY)
+                    model = genai.GenerativeModel('gemini-3.5-flash')
+                    response = model.generate_content(prompt)
+                    response_text = response.text
+                except Exception as e:
+                    logger.error(f"Gemini generation failed: {str(e)}")
+            else:
+                logger.warning("google-generativeai module not imported.")
+
+        # 2. Try OpenAI fallback
+        if not response_text and settings.OPENAI_API_KEY:
+            if OpenAI:
+                try:
+                    client = OpenAI(api_key=settings.OPENAI_API_KEY)
+                    response = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.0
+                    )
+                    response_text = response.choices[0].message.content
+                except Exception as e:
+                    logger.error(f"OpenAI generation failed: {str(e)}")
+
+        # 3. Try Anthropic fallback
+        if not response_text and settings.ANTHROPIC_API_KEY:
+            if anthropic:
+                try:
+                    client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+                    message = client.messages.create(
+                        model="claude-3-5-sonnet-20240620",
+                        max_tokens=2000,
+                        temperature=0.0,
+                        messages=[{"role": "user", "content": prompt}]
+                    )
+                    response_text = message.content[0].text
+                except Exception as e:
+                    logger.error(f"Anthropic generation failed: {str(e)}")
+
+        # 4. Mock Fallback (for testing / development without active keys)
+        if not response_text:
+            response_text = RAGEngine._mock_fallback_text(chunks)
+
+        # Check knowledge boundary violation in response
+        if "information is not available" in response_text.lower() or "not available in the current sap knowledge" in response_text.lower():
+            return "The requested information is not available in the current SAP knowledge base.", []
+
+        citations = RAGEngine.build_citations(response_text, chunks)
         return response_text, citations
+
+    # ------------------------------------------------------------------
+    # Real streaming (Phase 3)
+    # ------------------------------------------------------------------
+    # Per-provider generators below each yield raw text deltas as the
+    # underlying SDK produces them (`stream=True` on Gemini/OpenAI,
+    # `messages.stream()` on Anthropic) -- no artificial buffering, no
+    # re-chunking of an already-complete string.
+
+    @staticmethod
+    def _stream_gemini(prompt: str):
+        genai.configure(api_key=settings.GEMINI_API_KEY)
+        model = genai.GenerativeModel('gemini-3.5-flash')
+        response = model.generate_content(prompt, stream=True)
+        for chunk in response:
+            # `.text` is a computed property that can raise (e.g. a chunk
+            # with no parts, such as a safety-filtered piece) -- skip a bad
+            # chunk instead of killing the whole stream over it.
+            try:
+                text = chunk.text
+            except Exception:
+                continue
+            if text:
+                yield text
+
+    @staticmethod
+    def _stream_openai(prompt: str):
+        client = OpenAI(api_key=settings.OPENAI_API_KEY)
+        stream = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            stream=True,
+        )
+        for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            content = getattr(delta, "content", None) if delta else None
+            if content:
+                yield content
+
+    @staticmethod
+    def _stream_anthropic(prompt: str):
+        client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+        with client.messages.stream(
+            model="claude-3-5-sonnet-20240620",
+            max_tokens=2000,
+            temperature=0.0,
+            messages=[{"role": "user", "content": prompt}],
+        ) as stream:
+            for text in stream.text_stream:
+                yield text
+
+    @staticmethod
+    def _stream_llm_response(prompt: str, chunks: List[Dict[str, Any]]):
+        """
+        Tries providers in the same fallback order as `generate_response`
+        (Gemini -> OpenAI -> Anthropic -> mock), but adapted for real
+        streaming: once a provider has emitted at least one token to the
+        caller, we can no longer cleanly discard it and switch providers
+        mid-stream (the client has already seen those tokens over SSE), so
+        a failure *after* first-token only propagates -- it does not
+        silently fall back. A provider only gets skipped in favor of the
+        next one if it raises (or produces nothing) before yielding
+        anything.
+        """
+        providers = []
+        if settings.GEMINI_API_KEY and genai:
+            providers.append(("Gemini", RAGEngine._stream_gemini))
+        else:
+            logger.warning("Gemini not configured for streaming (missing API key or module).")
+        if settings.OPENAI_API_KEY and OpenAI:
+            providers.append(("OpenAI", RAGEngine._stream_openai))
+        if settings.ANTHROPIC_API_KEY and anthropic:
+            providers.append(("Anthropic", RAGEngine._stream_anthropic))
+
+        for name, provider_fn in providers:
+            yielded_any = False
+            try:
+                for chunk_text in provider_fn(prompt):
+                    if chunk_text:
+                        yielded_any = True
+                        yield chunk_text
+                if yielded_any:
+                    return  # provider completed successfully
+                logger.warning(f"{name} streaming produced no content; trying next provider.")
+            except Exception as e:
+                if yielded_any:
+                    # Tokens already reached the client over SSE -- cannot
+                    # cleanly discard them and hand off to another
+                    # provider mid-stream. Propagate; the caller (chat.py)
+                    # will save whatever partial text was already sent.
+                    logger.error(f"{name} streaming failed mid-stream after partial output: {str(e)}")
+                    raise
+                logger.error(f"{name} streaming failed before yielding any tokens, trying next provider: {str(e)}")
+                continue
+
+        # Every configured provider either isn't set up or failed before
+        # producing any output.
+        yield RAGEngine._mock_fallback_text(chunks)
+
+    @staticmethod
+    def stream_response(
+        db: Session,
+        collection_name: str,
+        query: str,
+        conversation_history: List[Dict[str, str]] = None,
+        chunks_out: List[Dict[str, Any]] = None,
+    ):
+        """
+        Generator-based streaming counterpart to `generate_response`. Yields
+        raw text deltas as they arrive from the provider (real token-level
+        streaming, not an artificial word-by-word replay of an
+        already-complete string).
+
+        `chunks_out`, if provided, is populated (in place) with the
+        retrieved context chunks before the first item is yielded, so the
+        caller can build citations from the full accumulated text once the
+        generator is exhausted via `RAGEngine.build_citations(full_text,
+        chunks_out)` -- the same citation-building logic `generate_response`
+        uses, applied post-hoc since citations depend on the complete `[N]`
+        marker text.
+
+        NOTE on the "knowledge boundary" safety net: `generate_response`
+        additionally re-scans the *complete* response text for the phrase
+        "information is not available" and, if found, discards the whole
+        response in favor of the canned boundary string. That retroactive
+        whole-response replacement is not reproducible here -- by the time
+        the full text is available, its tokens have already been streamed
+        to the client over SSE and cannot be un-sent. The only boundary
+        case still honored in the streaming path is the upfront one (zero
+        retrieved chunks -> emit the canned string directly without calling
+        any LLM), which covers the common case. See CLAUDE.md Phase 3 entry.
+        """
+        chunks = RAGEngine.hybrid_search(db, collection_name, query, limit=5)
+        if chunks_out is not None:
+            chunks_out.extend(chunks)
+
+        if not chunks:
+            yield "The requested information is not available in the current SAP knowledge base."
+            return
+
+        prompt = RAGEngine._build_prompt(chunks, conversation_history, query)
+        yield from RAGEngine._stream_llm_response(prompt, chunks)

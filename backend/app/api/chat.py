@@ -1,10 +1,11 @@
 import json
 import asyncio
-import re
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+import threading
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from typing import List, Dict, Any
+from loguru import logger
 
 from app.core.database import get_db
 from app.core.security import any_authenticated
@@ -96,6 +97,7 @@ def give_feedback(
 async def stream_chat_response(
     conv_id: int,
     query: str,
+    request: Request,
     collection: str = "Default",
     db: Session = Depends(get_db),
     current_user: User = Depends(any_authenticated)
@@ -104,19 +106,19 @@ async def stream_chat_response(
     conv = db.query(Conversation).filter(Conversation.id == conv_id).first()
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
-        
+
     # Save user message
     user_msg = Message(conversation_id=conv_id, role=MessageRole.USER, content=query, citations=[])
     db.add(user_msg)
     db.commit()
     db.refresh(user_msg)
-    
+
     # Retrieve history
     history = []
     messages = db.query(Message).filter(Message.conversation_id == conv_id).order_by(Message.created_at.asc()).all()
     for m in messages[:-1]: # Exclude the user message we just added
         history.append({"role": m.role, "content": m.content})
-        
+
     # Set conversation title dynamically if it is default
     if conv.title == "New Conversation":
         # First 4 words of the query
@@ -124,13 +126,69 @@ async def stream_chat_response(
         db.commit()
 
     async def event_generator():
-        # Retrieve RAG answer
-        # Since standard DB call is blocking, run in executive thread
+        # RAGEngine.stream_response is a *synchronous* generator (the
+        # provider SDKs -- google-generativeai / openai / anthropic -- are
+        # all sync streaming interfaces). Bridge it into the async SSE
+        # response by running it in a background thread that pushes each
+        # yielded delta into an asyncio.Queue; this coroutine pulls from
+        # the queue and forwards SSE `content` events as they arrive,
+        # without blocking the event loop.
         loop = asyncio.get_event_loop()
-        response_text, citations = await loop.run_in_executor(
-            None, RAGEngine.generate_response, db, collection, query, history
-        )
-        
+        queue: asyncio.Queue = asyncio.Queue()
+        chunks_out: List[Dict[str, Any]] = []
+        DONE = object()
+
+        def producer():
+            try:
+                for delta in RAGEngine.stream_response(db, collection, query, history, chunks_out=chunks_out):
+                    loop.call_soon_threadsafe(queue.put_nowait, ("content", delta))
+            except Exception as e:
+                logger.exception(f"Streaming generation failed for conversation {conv_id}")
+                loop.call_soon_threadsafe(queue.put_nowait, ("error", str(e)))
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, (DONE, None))
+
+        thread = threading.Thread(target=producer, daemon=True)
+        thread.start()
+
+        full_text_parts: List[str] = []
+        disconnected = False
+        tokens_since_disconnect_check = 0
+
+        while True:
+            kind, payload = await queue.get()
+            if kind == "content":
+                full_text_parts.append(payload)
+                data = {"type": "content", "delta": payload}
+                yield f"data: {json.dumps(data)}\n\n"
+
+                # Best-effort disconnect handling: check every few tokens
+                # rather than on every single one (is_disconnected() is
+                # itself an async call). If the client is gone, stop
+                # pulling/forwarding further tokens -- the background
+                # thread's in-flight provider SDK call cannot always be
+                # cancelled from here, but we stop consuming/forwarding at
+                # minimum, and (below) skip the citation-save DB work for
+                # an abandoned stream.
+                tokens_since_disconnect_check += 1
+                if tokens_since_disconnect_check >= 5:
+                    tokens_since_disconnect_check = 0
+                    if await request.is_disconnected():
+                        disconnected = True
+                        break
+            elif kind == "error":
+                logger.error(f"Chat stream error for conversation {conv_id}: {payload}")
+                break
+            elif kind is DONE:
+                break
+
+        if disconnected:
+            logger.info(f"Client disconnected mid-stream for conversation {conv_id}; skipping citation save.")
+            return
+
+        response_text = "".join(full_text_parts) or "An error occurred while generating the response."
+        citations = RAGEngine.build_citations(response_text, chunks_out)
+
         # Save assistant message
         assistant_msg = Message(
             conversation_id=conv_id,
@@ -158,16 +216,6 @@ async def stream_chat_response(
             ])
             db.commit()
 
-        # Yield the tokens chunk by chunk to simulate stream
-        # Split by words/whitespace
-        tokens = re.findall(r'\S+\s*', response_text)
-        
-        for token in tokens:
-            data = {"type": "content", "delta": token}
-            yield f"data: {json.dumps(data)}\n\n"
-            # Add micro-delay for smooth experience
-            await asyncio.sleep(0.01)
-            
         # Send citations and DB IDs so frontend can display clickable sources and submit feedback
         data = {
             "type": "citations",
@@ -175,7 +223,7 @@ async def stream_chat_response(
             "citations": citations
         }
         yield f"data: {json.dumps(data)}\n\n"
-        
+
         # Send done packet
         yield "data: {\"type\": \"done\"}\n\n"
 
