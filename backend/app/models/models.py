@@ -1,7 +1,8 @@
 import datetime
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, Text, JSON
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, Text, JSON, Computed
 from sqlalchemy import Enum as SQLAlchemyEnum
-from sqlalchemy.orm import relationship
+from sqlalchemy.dialects.postgresql import TSVECTOR
+from sqlalchemy.orm import relationship, deferred
 from app.core.database import Base
 from app.core.roles import Role, DocumentStatus, MessageRole
 
@@ -87,6 +88,33 @@ class Chunk(Base):
     # and this column, so id-generation logic lives in exactly one place.
     vector_id = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    # Postgres-only generated column (Phase 4 full-text search fix, see
+    # alembic/versions/e2a7c4f91b30_phase4_fulltext_search.py): computed by
+    # the DB itself from `text` via `to_tsvector('english', text)`, backed
+    # by a GIN index, and queried in RAGEngine._db_keyword_search via
+    # `plainto_tsquery`/`ts_rank` -- this replaces the old
+    # `Chunk.text.ilike('%word%')` full-table-scan "keyword search" leg of
+    # hybrid_search. NEVER written from Python: `Computed(...)` tells
+    # SQLAlchemy this column is server-generated, so it's excluded from
+    # INSERT/UPDATE value lists (the DB computes it, ORM just reads it
+    # back). Wrapped in `deferred()` so it is NOT included in the default
+    # SELECT list for ordinary `db.query(Chunk)` reads elsewhere in the
+    # codebase (document listing, chunk deletion, etc.) -- nothing needs
+    # the raw tsvector value in Python, it's only ever referenced as a raw
+    # column expression inside DB-side filter/order_by clauses.
+    #
+    # IMPORTANT / known limitation: `TSVECTOR` has no SQLite equivalent, and
+    # the hand-written migration only adds this physical column when
+    # running against Postgres (no-ops on other dialects). That means a
+    # SQLite-backed `chunks` table (used for scratch/local verification in
+    # every prior phase) genuinely lacks this column once this migration is
+    # applied, so ANY ORM operation that touches the full `Chunk` entity
+    # (inserts included, since SQLAlchemy still references this mapped
+    # column when building INSERT/RETURNING clauses) will error against
+    # SQLite. Unlike Phases 0-3, this migration/column could not be
+    # round-trip-verified against a scratch SQLite DB for that reason --
+    # see the Phase 4 CLAUDE.md Work Log entry.
+    text_search = deferred(Column(TSVECTOR, Computed("to_tsvector('english', text)", persisted=True)))
 
     document = relationship("Document", back_populates="chunks")
 
