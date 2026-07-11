@@ -1,0 +1,113 @@
+import os
+import sys
+from sqlalchemy.orm import Session
+
+# Setup python path to import app correctly
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+from app.core.database import SessionLocal, Base, engine
+from app.models.models import Document, Chunk
+from app.services.parser import DocumentParser
+from app.services.chunker import DocumentChunker
+from app.services.vector_db import VectorDBService
+
+def seed_specification():
+    source_file_path = r"C:\Users\tttsa\.gemini\antigravity-ide\brain\e2854cfe-db8a-4ac1-a90a-4442b6c941cb\.system_generated\steps\7\content.md"
+    target_dir = "./uploads"
+    target_filename = "sap_governance_spec.txt"
+    target_file_path = os.path.join(target_dir, target_filename)
+    collection_name = "Default"
+
+    # Ensure uploads directory exists
+    os.makedirs(target_dir, exist_ok=True)
+
+    # 1. Read from system download path and write to uploads
+    if not os.path.exists(source_file_path):
+        print(f"Source file not found at {source_file_path}")
+        return
+
+    with open(source_file_path, "r", encoding="utf-8", errors="ignore") as src:
+        content = src.read()
+
+    with open(target_file_path, "w", encoding="utf-8") as tgt:
+        tgt.write(content)
+
+    print(f"Copied specification document to {target_file_path}")
+
+    # 2. Database Session setup
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    try:
+        # Check if already seeded to avoid duplicates
+        existing_doc = db.query(Document).filter(Document.filename == target_filename).first()
+        if existing_doc:
+            print(f"Document {target_filename} already exists. Deleting to re-ingest...")
+            # Delete vectors
+            VectorDBService.delete_document_vectors(existing_doc.collection_name, existing_doc.id)
+            # Delete DB record (cascade deletes chunks)
+            db.delete(existing_doc)
+            db.commit()
+
+        file_size = os.path.getsize(target_file_path)
+
+        # 3. Create Document in DB
+        db_doc = Document(
+            filename=target_filename,
+            file_path=target_file_path,
+            file_size=file_size,
+            collection_name=collection_name,
+            document_type="TXT",
+            status="processing",
+            total_chunks=0
+        )
+        db.add(db_doc)
+        db.commit()
+        db.refresh(db_doc)
+
+        print(f"Created Document record in DB with ID: {db_doc.id}")
+
+        # 4. Parse file
+        pages = DocumentParser.parse_file(target_file_path, target_filename)
+
+        # 5. Chunk file
+        chunks = DocumentChunker.chunk_document(pages)
+
+        # 6. Save chunks in DB
+        db_chunks = []
+        for c in chunks:
+            chunk_obj = Chunk(
+                document_id=db_doc.id,
+                text=c["text"],
+                chunk_index=c["chunk_index"],
+                page_number=c["page_number"],
+                section_header=c["section_header"],
+                chunk_metadata=c["chunk_metadata"]
+            )
+            db.add(chunk_obj)
+            db_chunks.append(chunk_obj)
+        db.commit()
+
+        print(f"Saved {len(db_chunks)} chunks to PostgreSQL database.")
+
+        # 7. Index chunks in Qdrant
+        VectorDBService.upsert_chunks(
+            collection_name=collection_name,
+            document_id=db_doc.id,
+            filename=target_filename,
+            chunks=chunks
+        )
+
+        # 8. Mark document as active
+        db_doc.status = "active"
+        db_doc.total_chunks = len(chunks)
+        db.commit()
+
+        print(f"Document ingestion completed successfully for {target_filename}!")
+    except Exception as e:
+        print(f"Failed to seed document: {str(e)}")
+        db.rollback()
+    finally:
+        db.close()
+
+if __name__ == "__main__":
+    seed_specification()
