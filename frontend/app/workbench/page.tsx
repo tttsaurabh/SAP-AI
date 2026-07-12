@@ -6,7 +6,8 @@ import { api, getAuthToken, getUserRole } from "@/lib/api";
 import { 
   ArrowLeft, Terminal, AlertTriangle, CheckCircle, HelpCircle, Info,
   Settings, Key, Download, Cpu, Play, RefreshCw, FileCode, Check, Copy,
-  Network, Share2, Layers, ShieldAlert, CheckSquare, ListTodo, LogIn, FlaskConical
+  Network, Share2, Layers, ShieldAlert, CheckSquare, ListTodo, LogIn, FlaskConical,
+  Moon, Sun
 } from "lucide-react";
 
 // Small inline badge shown next to any panel that renders data from a
@@ -24,6 +25,30 @@ function SimulatedBadge() {
 
 export default function WorkbenchPage() {
   const router = useRouter();
+
+  // Theme state
+  const [theme, setTheme] = useState("light");
+
+  useEffect(() => {
+    const savedTheme = localStorage.getItem("theme") || "light";
+    setTheme(savedTheme);
+    if (savedTheme === "dark") {
+      document.documentElement.classList.add("dark");
+    } else {
+      document.documentElement.classList.remove("dark");
+    }
+  }, []);
+
+  const toggleTheme = () => {
+    const newTheme = theme === "light" ? "dark" : "light";
+    setTheme(newTheme);
+    localStorage.setItem("theme", newTheme);
+    if (newTheme === "dark") {
+      document.documentElement.classList.add("dark");
+    } else {
+      document.documentElement.classList.remove("dark");
+    }
+  };
   
   // Navigation & Tabs
   const [activeTab, setActiveTab] = useState<"diagnostics" | "snote" | "clean_core" | "transition" | "integration">("diagnostics");
@@ -221,10 +246,10 @@ export default function WorkbenchPage() {
   }, [targetSystem]);
 
   return (
-    <div className="flex h-screen w-screen bg-[#05070e] text-[#f1f5f9] overflow-hidden">
+    <div className="flex h-screen w-screen bg-background text-foreground overflow-hidden">
       {/* Glow Effects */}
-      <div className="absolute top-[10%] left-[10%] h-[350px] w-[350px] rounded-full bg-purple-600/5 blur-[110px] pointer-events-none" />
-      <div className="absolute bottom-[10%] right-[10%] h-[350px] w-[350px] rounded-full bg-blue-600/5 blur-[110px] pointer-events-none" />
+      <div className="absolute top-[10%] left-[10%] h-[350px] w-[350px] rounded-full bg-purple-600/3 dark:bg-purple-600/5 blur-[110px] pointer-events-none" />
+      <div className="absolute bottom-[10%] right-[10%] h-[350px] w-[350px] rounded-full bg-blue-600/3 dark:bg-blue-600/5 blur-[110px] pointer-events-none" />
 
       {/* Main Container */}
       <div className="flex-1 flex flex-col h-full overflow-hidden relative z-10">
@@ -239,23 +264,33 @@ export default function WorkbenchPage() {
         </div>
 
         {/* Top Header */}
-        <header className="flex h-16 items-center justify-between border-b border-slate-800/60 bg-slate-950/20 px-6 backdrop-blur-md">
+        <header className="flex h-16 items-center justify-between border-b border-border bg-card/20 px-6 backdrop-blur-md">
           <div className="flex items-center gap-3">
             <button
               onClick={() => router.push("/chat")}
-              className="flex h-9 w-9 items-center justify-center rounded-lg border border-slate-800 bg-slate-900/50 text-slate-400 hover:text-white transition-all"
+              className="flex h-9 w-9 items-center justify-center rounded-lg border border-border bg-muted/40 text-muted-foreground hover:text-foreground transition-all"
               title="Return to Chat"
               aria-label="Return to chat"
             >
               <ArrowLeft className="h-4 w-4" />
             </button>
             <div className="flex items-center gap-2">
-              <Cpu className="h-5 w-5 text-purple-400" />
-              <h1 className="text-sm font-bold text-white tracking-wider">SAP AGENTIC WORKBENCH</h1>
+              <Cpu className="h-5 w-5 text-purple-500 dark:text-purple-400" />
+              <h1 className="text-sm font-bold text-foreground tracking-wider">SAP AGENTIC WORKBENCH</h1>
             </div>
           </div>
-          <div className="text-xs text-slate-500 font-semibold uppercase tracking-widest bg-slate-900/55 px-3 py-1.5 rounded-lg border border-slate-800/80">
-            RAP & Clean Core Tools
+          <div className="flex items-center gap-3">
+            <button
+              onClick={toggleTheme}
+              title={theme === "light" ? "Switch to Dark Mode" : "Switch to Light Mode"}
+              className="flex h-9 w-9 items-center justify-center rounded-lg border border-border bg-muted/40 text-muted-foreground hover:text-primary transition-all"
+              aria-label="Toggle theme"
+            >
+              {theme === "light" ? <Moon className="h-4 w-4" /> : <Sun className="h-4 w-4" />}
+            </button>
+            <div className="text-xs text-muted-foreground font-semibold uppercase tracking-widest bg-muted px-3 py-1.5 rounded-lg border border-border">
+              RAP & Clean Core Tools
+            </div>
           </div>
         </header>
 

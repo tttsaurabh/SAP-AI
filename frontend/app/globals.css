@@ -4,16 +4,45 @@
 
 @layer base {
   :root {
-    --background: 224 80% 4.5%;      /* #05070f deep dark navy */
+    --background: 210 40% 98%;        /* #f8fafc light slate background */
+    --foreground: 222.2 84% 4.9%;     /* #0f172a deep slate text */
+    
+    --card: 0 0% 100%;                /* #ffffff pure white card */
+    --card-foreground: 222.2 84% 4.9%;
+    
+    --popover: 0 0% 100%;
+    --popover-foreground: 222.2 84% 4.9%;
+    
+    --primary: 221.2 83.2% 53.3%;     /* #3b82f6 primary blue */
+    --primary-foreground: 210 20% 98%;
+    
+    --secondary: 210 40% 96.1%;       /* #f1f5f9 light slate */
+    --secondary-foreground: 222.2 47.4% 11.2%;
+    
+    --muted: 210 40% 96.1%;
+    --muted-foreground: 215.4 16.3% 46.9%; /* #64748b gray */
+    
+    --accent: 258 90% 66%;            /* #818CF8 Indigo accent */
+    --accent-foreground: 210 20% 98%;
+    
+    --border: 214.3 32% 90.2%;        /* #e2e8f0 border */
+    --input: 214.3 32% 90.2%;
+    --ring: 258 90% 66%;
+    
+    --radius: 1rem;
+  }
+
+  .dark {
+    --background: 224 80% 4.5%;       /* #05070f deep dark navy */
     --foreground: 210 20% 98%;
     
-    --card: 223 60% 8%;              /* #0a0f1d dark card */
+    --card: 223 60% 8%;               /* #0a0f1d dark card */
     --card-foreground: 210 20% 98%;
     
     --popover: 224 80% 4.5%;
     --popover-foreground: 210 20% 98%;
     
-    --primary: 221.2 83.2% 53.3%;    /* #3B82F6 primary blue */
+    --primary: 221.2 83.2% 53.3%;
     --primary-foreground: 210 20% 98%;
     
     --secondary: 222.2 47.4% 11.2%;
@@ -22,14 +51,12 @@
     --muted: 222.2 47.4% 11.2%;
     --muted-foreground: 215.4 16.3% 70%;
     
-    --accent: 258 90% 66%;           /* #818CF8 Indigo accent */
+    --accent: 258 90% 66%;
     --accent-foreground: 210 20% 98%;
     
-    --border: 223 35% 15%;           /* #1a233a subtle premium border */
+    --border: 223 35% 15%;            /* #1a233a subtle border */
     --input: 223 35% 15%;
     --ring: 258 90% 66%;
-    
-    --radius: 1rem;
   }
 }
 
