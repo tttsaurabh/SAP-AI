@@ -21,6 +21,10 @@ export interface Message {
   created_at: string;
 }
 
+export interface ExplainSimplyResponse {
+  explanation: string;
+}
+
 export interface Conversation {
   id: number;
   user_id: number;
@@ -321,6 +325,15 @@ export const api = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(feedback),
+    });
+    return res.json();
+  },
+
+  explainChunkSimply: async (chunkId: number, query: string): Promise<ExplainSimplyResponse> => {
+    const res = await fetchClient("/chat/explain", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chunk_id: chunkId, query }),
     });
     return res.json();
   },

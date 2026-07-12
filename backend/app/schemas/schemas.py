@@ -107,6 +107,17 @@ class MessageResponse(BaseModel):
     class Config:
         from_attributes = True
 
+# --- "Explain simply" chat-widget feature ---
+class ExplainSimplyRequest(BaseModel):
+    # References an existing Chunk row so the explanation is always grounded
+    # in real, server-resolved retrieved content -- never arbitrary
+    # client-supplied "context" text.
+    chunk_id: int
+    query: str
+
+class ExplainSimplyResponse(BaseModel):
+    explanation: str
+
 class ConversationCreate(BaseModel):
     title: Optional[str] = "New Conversation"
 

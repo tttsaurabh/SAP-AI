@@ -6,7 +6,7 @@ import { api, getAuthToken, getUserRole, getUserEmail, clearAuthToken, Message, 
 import { 
   MessageSquare, Plus, LogOut, Send, Bot, User as UserIcon, BookOpen,
   Settings, ThumbsUp, ThumbsDown, Copy, Download, Moon, Sun,
-  ChevronRight, RefreshCw, X, FileText, Check, Terminal, Database, ArrowDown, Search, Layers
+  ChevronRight, RefreshCw, X, FileText, Check, Terminal, Database, ArrowDown, Search, Layers, Sparkles
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
@@ -56,7 +56,13 @@ export default function ChatPage() {
   
   // Active citation states
   const [selectedCitation, setSelectedCitation] = useState<Citation | null>(null);
+  const [selectedCitationQuery, setSelectedCitationQuery] = useState("");
   const [copiedId, setCopiedId] = useState<number | null>(null);
+
+  // "Explain simply" states (Source Verification drawer)
+  const [explainText, setExplainText] = useState("");
+  const [explainLoading, setExplainLoading] = useState(false);
+  const [explainError, setExplainError] = useState("");
 
   // FAB Scroll-to-bottom visibility
   const [showScrollBottom, setShowScrollBottom] = useState(false);
@@ -600,7 +606,12 @@ export default function ChatPage() {
                             {m.citations.map((c, cIdx) => (
                               <button
                                 key={cIdx}
-                                onClick={() => setSelectedCitation(c)}
+                                onClick={() => {
+                                  setSelectedCitation(c);
+                                  setSelectedCitationQuery(activeConv?.messages?.[idx - 1]?.content || "");
+                                  setExplainText("");
+                                  setExplainError("");
+                                }}
                                 className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-muted/50 hover:bg-primary/10 hover:border-primary/30 px-3 py-1.5 text-xs text-muted-foreground hover:text-primary font-medium transition-all"
                               >
                                 <FileText className="h-3 w-3 text-indigo-500 dark:text-indigo-400" />
@@ -696,7 +707,11 @@ export default function ChatPage() {
                   <h3 className="font-bold text-foreground">Source Verification</h3>
                 </div>
                 <button
-                  onClick={() => setSelectedCitation(null)}
+                  onClick={() => {
+                    setSelectedCitation(null);
+                    setExplainText("");
+                    setExplainError("");
+                  }}
                   className="text-muted-foreground hover:text-foreground transition-all"
                   aria-label="Close citation drawer"
                 >
@@ -736,6 +751,46 @@ export default function ChatPage() {
                     </p>
                   )}
                 </div>
+
+                {/* "Explain simply" -- plain-language explanation of the cited segment */}
+                {selectedCitation.text && selectedCitation.chunk_id != null && (
+                  <div className="rounded-xl bg-muted/40 border border-border p-4 space-y-2.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 text-xs font-bold text-muted-foreground uppercase tracking-wider">
+                        <Sparkles className="h-4.5 w-4.5 text-primary" />
+                        <span>Explain Simply</span>
+                      </div>
+                      {!explainText && (
+                        <button
+                          onClick={async () => {
+                            setExplainLoading(true);
+                            setExplainError("");
+                            try {
+                              const res = await api.explainChunkSimply(selectedCitation.chunk_id as number, selectedCitationQuery);
+                              setExplainText(res.explanation);
+                            } catch (err: any) {
+                              setExplainError(err.message || "Couldn't generate an explanation right now.");
+                            } finally {
+                              setExplainLoading(false);
+                            }
+                          }}
+                          disabled={explainLoading}
+                          className="text-[10px] font-bold uppercase tracking-wider rounded-lg bg-primary/10 hover:bg-primary/20 text-primary px-2.5 py-1 transition-all disabled:opacity-50"
+                        >
+                          {explainLoading ? "Explaining..." : "Explain this"}
+                        </button>
+                      )}
+                    </div>
+                    {explainError && (
+                      <p className="text-xs text-red-500">{explainError}</p>
+                    )}
+                    {explainText && (
+                      <div className="text-xs text-foreground leading-relaxed">
+                        <ReactMarkdown>{explainText}</ReactMarkdown>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
           </div>

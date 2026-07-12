@@ -10,8 +10,8 @@ from loguru import logger
 from app.core.database import get_db
 from app.core.security import any_authenticated
 from app.core.roles import Role, MessageRole
-from app.models.models import User, Conversation, Message, Feedback, Citation
-from app.schemas.schemas import ConversationResponse, ConversationDetail, MessageResponse, FeedbackCreate, FeedbackResponse
+from app.models.models import User, Conversation, Message, Feedback, Citation, Chunk
+from app.schemas.schemas import ConversationResponse, ConversationDetail, MessageResponse, FeedbackCreate, FeedbackResponse, ExplainSimplyRequest, ExplainSimplyResponse
 from app.services.rag_engine import RAGEngine
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
@@ -92,6 +92,25 @@ def give_feedback(
     db.commit()
     db.refresh(feedback)
     return feedback
+
+@router.post("/explain", response_model=ExplainSimplyResponse)
+def explain_chunk_simply(
+    payload: ExplainSimplyRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(any_authenticated)
+):
+    """
+    "Explain this simply" chat-widget feature: re-fetches the chunk's
+    canonical text server-side by id (rather than trusting client-supplied
+    context text) and asks the LLM to explain it in plain language, per the
+    hardened prompt in RAGEngine.explain_simply.
+    """
+    chunk = db.query(Chunk).filter(Chunk.id == payload.chunk_id).first()
+    if not chunk:
+        raise HTTPException(status_code=404, detail="Chunk not found")
+
+    explanation = RAGEngine.explain_simply(payload.query, chunk.text)
+    return ExplainSimplyResponse(explanation=explanation)
 
 @router.get("/conversations/{conv_id}/stream")
 async def stream_chat_response(
