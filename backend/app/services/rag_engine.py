@@ -313,11 +313,63 @@ class RAGEngine:
             .filter(Chunk.text_search.op('@@')(tsquery))
         )
 
-        return (
-            query_filter.order_by(func.ts_rank(Chunk.text_search, tsquery).desc())
-            .limit(limit)
-            .all()
-        )
+        try:
+            results = (
+                query_filter.order_by(func.ts_rank(Chunk.text_search, tsquery).desc())
+                .limit(limit)
+                .all()
+            )
+            if results:
+                return results
+
+            relaxed_tsquery = RAGEngine._build_relaxed_keyword_tsquery(query)
+            if not relaxed_tsquery:
+                return []
+
+            relaxed_query = func.to_tsquery('english', relaxed_tsquery)
+            return (
+                db.query(Chunk, Document.filename)
+                .join(Document)
+                .filter(Document.collection_name == collection_name)
+                .filter(Chunk.is_parent.is_(False))
+                .filter(Chunk.text_search.op('@@')(relaxed_query))
+                .order_by(func.ts_rank(Chunk.text_search, relaxed_query).desc())
+                .limit(limit)
+                .all()
+            )
+        except Exception as e:
+            logger.error(f"Postgres keyword search failed: {e}")
+            return []
+
+    @staticmethod
+    def _build_relaxed_keyword_tsquery(query: str) -> str:
+        """
+        Builds a safe OR-based tsquery from meaningful user terms.
+
+        The strict `plainto_tsquery` pass above is precise, but ordinary chat
+        prompts often include command words ("explain", "what", "process")
+        that are not guaranteed to appear in SAP documentation. This relaxed
+        fallback keeps domain terms like MDG/GenIL/Change/Request findable
+        when the vector leg is unavailable or dimension-mismatched.
+        """
+        stop_words = {
+            "a", "an", "and", "are", "as", "about", "by", "can", "do",
+            "does", "explain", "for", "from", "give", "how", "in", "is",
+            "me", "of", "on", "please", "process", "tell", "the", "to",
+            "what", "with",
+        }
+        terms = []
+        seen = set()
+        for raw in re.findall(r"[A-Za-z0-9]+", query):
+            term = raw.lower()
+            if len(term) < 2 or term in stop_words or term in seen:
+                continue
+            seen.add(term)
+            terms.append(term)
+            if len(terms) >= 8:
+                break
+
+        return " | ".join(terms)
 
     @staticmethod
     def _build_prompt(chunks: List[Dict[str, Any]], conversation_history: List[Dict[str, str]], query: str) -> str:

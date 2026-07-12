@@ -64,5 +64,11 @@ class TestSAPRAGPipeline(unittest.TestCase):
         finally:
             RAGEngine.hybrid_search = original_hybrid_search
 
+    def test_relaxed_keyword_tsquery_keeps_domain_terms(self):
+        # Normal chat wording should not make full-text fallback search require
+        # filler words like "explain".
+        tsquery = RAGEngine._build_relaxed_keyword_tsquery("Explain MDG Change Request process.")
+        self.assertEqual(tsquery, "mdg | change | request")
+
 if __name__ == "__main__":
     unittest.main()
