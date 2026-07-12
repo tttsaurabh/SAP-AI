@@ -59,8 +59,12 @@ def seed_specification():
         # 4. Parse file
         pages = DocumentParser.parse_file(target_file_path, target_filename)
 
-        # 5. Chunk file
-        chunks = DocumentChunker.chunk_document(pages)
+        # 5. Chunk file (pass defaults explicitly so they can be persisted below)
+        chunk_size = DocumentChunker.DEFAULT_CHUNK_SIZE_TOKENS
+        chunk_overlap = DocumentChunker.DEFAULT_CHUNK_OVERLAP_TOKENS
+        chunks = DocumentChunker.chunk_document(pages, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        db_doc.chunk_size = chunk_size
+        db_doc.chunk_overlap = chunk_overlap
 
         # 6. Save chunks in DB
         db_chunks = []

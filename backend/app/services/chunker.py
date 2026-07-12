@@ -66,7 +66,17 @@ _HEADING_RE = re.compile(
     re.IGNORECASE
 )
 
-_UPPER_HEADING_RE = re.compile(r'^[A-Z][A-Z0-9 :\/\-]{4,80}$')
+_UPPER_HEADING_RE = re.compile(r'^(?=.*\s)[A-Z][A-Z0-9 :\/\-]{4,80}$')
+
+# A run of this many or more consecutive heading-matching lines is treated as a
+# Table of Contents / Index / glossary listing rather than real section headings
+# (see _classify_segments). Verified empirically against public/*.pdf: on
+# "SAP MDG ... Comprehensive Guide.pdf", 39 of 1234 pages (ToC/Index/glossary
+# pages, one with 49 heading-pattern matches on a single page) accounted for
+# 758 of 1132 total chunks before this fix, because each numbered listing line
+# ("6.3.2   Simple Checks in...") matches the same regex as a real heading and
+# individually flushes the chunk buffer.
+_TOC_RUN_THRESHOLD = 3
 
 
 def _is_heading(line: str) -> bool:
@@ -141,8 +151,24 @@ def _classify_segments(text: str) -> List[Dict[str, Any]]:
             segments.append({"type": "procedure", "text": "\n".join(block_lines)})
             continue
 
-        # ── Heading ─────────────────────────────────────────────────────────
+        # ── Heading (or dense run of heading-like lines = ToC/Index listing) ──
         if _is_heading(line) and line.strip():
+            # Look ahead for a run of consecutive heading-matching lines. A real
+            # section heading in body prose is isolated (surrounded by
+            # paragraph text); a dense back-to-back run of lines that each
+            # individually match the heading regex is characteristic of a
+            # Table of Contents, Index, or glossary listing, where treating
+            # every line as its own heading would flush the chunk buffer once
+            # per line and produce a near-empty chunk per entry.
+            run_end = i
+            while run_end < len(lines) and lines[run_end].strip() and _is_heading(lines[run_end]):
+                run_end += 1
+            run_length = run_end - i
+            if run_length >= _TOC_RUN_THRESHOLD:
+                block_lines = [lines[j].strip() for j in range(i, run_end)]
+                segments.append({"type": "text", "text": "\n".join(block_lines)})
+                i = run_end
+                continue
             segments.append({"type": "heading", "text": line.strip()})
             i += 1
             continue

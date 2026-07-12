@@ -77,7 +77,8 @@ def ingest_pdf(db: Session, pdf_path: str, filename: str) -> bool:
         return False
 
     # 2. Chunk
-    chunks = DocumentChunker.chunk_document(pages, chunk_size=1200, chunk_overlap=200)
+    chunk_size, chunk_overlap = 1200, 200
+    chunks = DocumentChunker.chunk_document(pages, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
     if not chunks:
         logger.warning(f"[SKIP] No chunks generated for {filename}")
         return False
@@ -93,6 +94,8 @@ def ingest_pdf(db: Session, pdf_path: str, filename: str) -> bool:
         document_type="PDF",
         status="processing",
         total_chunks=0,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
     )
     db.add(db_doc)
     db.commit()

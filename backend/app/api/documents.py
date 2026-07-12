@@ -90,8 +90,17 @@ def process_document_ingestion(document_id: int, file_path: str, filename: str, 
         # 1. Parse File
         pages = DocumentParser.parse_file(file_path, filename)
 
-        # 2. Chunk File
-        chunks = DocumentChunker.chunk_document(pages)
+        # 2. Chunk File. Pass the chunker's defaults explicitly (rather than
+        # relying on them implicitly) so the exact values used can be
+        # persisted onto the Document row below -- see chunk_size/
+        # chunk_overlap on the model and the Phase 5 CLAUDE.md Work Log
+        # entry for why this matters (different ingestion entry points used
+        # different, previously-unrecorded values).
+        chunk_size = DocumentChunker.DEFAULT_CHUNK_SIZE_TOKENS
+        chunk_overlap = DocumentChunker.DEFAULT_CHUNK_OVERLAP_TOKENS
+        chunks = DocumentChunker.chunk_document(pages, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        db_doc.chunk_size = chunk_size
+        db_doc.chunk_overlap = chunk_overlap
 
         # Generate vector IDs here -- single source of truth, reused both for
         # the vector store upsert and the Chunk.vector_id column, instead of

@@ -67,6 +67,15 @@ class Document(Base):
     # status is processing/active.
     error_message = Column(Text, nullable=True)
     total_chunks = Column(Integer, default=0)
+    # The exact chunk_size/chunk_overlap (in tokens) actually passed to
+    # DocumentChunker.chunk_document(...) for this document, so retrieval-time
+    # chunk granularity is explainable after the fact. Different ingestion
+    # entry points historically used different values (interactive upload and
+    # seed_spec.py used the chunker's defaults of 450/80; ingest_public_pdfs.py
+    # overrode to 1200/200) with no record of which was used -- see Phase 5
+    # CLAUDE.md Work Log entry.
+    chunk_size = Column(Integer, nullable=True)
+    chunk_overlap = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
