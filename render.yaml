@@ -20,7 +20,7 @@ services:
       - key: ACCESS_TOKEN_EXPIRE_MINUTES
         value: "120"
       - key: CORS_ALLOWED_ORIGINS
-        value: "http://localhost:3000,http://127.0.0.1:3000,https://mdgbuddy.vercel.app"
+        value: "http://localhost:3000,http://127.0.0.1:3000,https://mdgbuddy.vercel.app,https://sapmdg.vercel.app"
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_ANON_KEY
