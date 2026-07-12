@@ -1,4 +1,25 @@
 import os
+import gc
+
+# ── Render Free Tier Memory Optimization (512MB RAM Limit) ───────────────────
+# Limit PyTorch CPU threads and memory allocations to prevent OOM crashes.
+# This saves ~100MB of RAM during startup and RAG execution.
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["TORCH_NUM_THREADS"] = "1"
+os.environ["PYTORCH_MALLOC_CONF"] = "max_split_size_mb:32"
+
+try:
+    import torch
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+    torch.set_grad_enabled(False)
+except ImportError:
+    pass
+
 import time
 from contextlib import asynccontextmanager
 
@@ -70,6 +91,7 @@ async def lifespan(app: FastAPI):
     # (see backend/PERFORMANCE_AUDIT.md). run_in_threadpool so this doesn't
     # block anything else during startup any more than necessary.
     await run_in_threadpool(EmbeddingsService.warm_up)
+    gc.collect()  # Force garbage collection to release loading overhead RAM
     yield
 
 # Create FastAPI Instance
