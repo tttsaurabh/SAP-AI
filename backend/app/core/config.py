@@ -58,6 +58,8 @@ class Settings(BaseSettings):
     VECTOR_DB_BACKEND: str = "supabase"
     PINECONE_API_KEY: str = ""
     PINECONE_INDEX_NAME: str = "sap-knowledge"
+    QDRANT_HOST: str = "localhost"
+    QDRANT_PORT: int = 6333
     
     # Supabase pgvector table name
     SUPABASE_VECTOR_TABLE: str = "document_vectors"

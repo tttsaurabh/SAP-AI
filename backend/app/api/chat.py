@@ -1,15 +1,18 @@
 import json
+import time
 import asyncio
 import threading
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
+from starlette.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from loguru import logger
 
 from app.core.database import get_db
 from app.core.security import any_authenticated
 from app.core.roles import Role, MessageRole
+from app.core.timing import phase
 from app.models.models import User, Conversation, Message, Feedback, Citation, Chunk
 from app.schemas.schemas import ConversationResponse, ConversationDetail, MessageResponse, FeedbackCreate, FeedbackResponse, ExplainSimplyRequest, ExplainSimplyResponse
 from app.services.rag_engine import RAGEngine
@@ -112,6 +115,61 @@ def explain_chunk_simply(
     explanation = RAGEngine.explain_simply(payload.query, chunk.text)
     return ExplainSimplyResponse(explanation=explanation)
 
+def _load_conversation(db: Session, conv_id: int) -> Optional[Conversation]:
+    with phase("chat.conversation_lookup", conv_id=conv_id):
+        return db.query(Conversation).filter(Conversation.id == conv_id).first()
+
+def _save_user_message(db: Session, conv_id: int, query: str) -> Message:
+    with phase("chat.save_user_message", conv_id=conv_id):
+        user_msg = Message(conversation_id=conv_id, role=MessageRole.USER, content=query, citations=[])
+        db.add(user_msg)
+        db.commit()
+        db.refresh(user_msg)
+        return user_msg
+
+def _load_history(db: Session, conv_id: int) -> List[Message]:
+    with phase("chat.load_history", conv_id=conv_id):
+        return db.query(Message).filter(Message.conversation_id == conv_id).order_by(Message.created_at.asc()).all()
+
+def _maybe_set_title(db: Session, conv: Conversation, query: str) -> None:
+    if conv.title == "New Conversation":
+        with phase("chat.set_title", conv_id=conv.id):
+            # First 4 words of the query
+            conv.title = " ".join(query.split()[:4]) + "..."
+            db.commit()
+
+def _save_assistant_message(db: Session, conv_id: int, response_text: str, citations: List[Dict[str, Any]]) -> Message:
+    with phase("chat.save_assistant_message", conv_id=conv_id):
+        assistant_msg = Message(
+            conversation_id=conv_id,
+            role=MessageRole.ASSISTANT,
+            content=response_text,
+            citations=citations
+        )
+        db.add(assistant_msg)
+        db.commit()
+        db.refresh(assistant_msg)
+        return assistant_msg
+
+def _save_citations(db: Session, conv_id: int, message_id: int, citations: List[Dict[str, Any]]) -> None:
+    # Also persist a durable, joinable Citation row per citation (e.g.
+    # "which chunks get cited most"). Additive alongside the JSON
+    # `citations` column above, which stays the fast denormalized read
+    # path for the chat UI. `chunk_id` may be None if the citation's
+    # source chunk couldn't be resolved back to a DB row.
+    if not citations:
+        return
+    with phase("chat.save_citations", conv_id=conv_id, count=len(citations)):
+        db.bulk_save_objects([
+            Citation(
+                message_id=message_id,
+                chunk_id=citation.get("chunk_id"),
+                rank=rank
+            )
+            for rank, citation in enumerate(citations)
+        ])
+        db.commit()
+
 @router.get("/conversations/{conv_id}/stream")
 async def stream_chat_response(
     conv_id: int,
@@ -121,28 +179,24 @@ async def stream_chat_response(
     db: Session = Depends(get_db),
     current_user: User = Depends(any_authenticated)
 ):
-    # Verify conversation
-    conv = db.query(Conversation).filter(Conversation.id == conv_id).first()
+    # Each of these does a blocking DB round trip; run_in_threadpool keeps
+    # them off the event loop so one slow request can't stall every other
+    # concurrent request being served by this process (see
+    # backend/PERFORMANCE_AUDIT.md).
+    conv = await run_in_threadpool(_load_conversation, db, conv_id)
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    # Save user message
-    user_msg = Message(conversation_id=conv_id, role=MessageRole.USER, content=query, citations=[])
-    db.add(user_msg)
-    db.commit()
-    db.refresh(user_msg)
+    await run_in_threadpool(_save_user_message, db, conv_id, query)
 
     # Retrieve history
     history = []
-    messages = db.query(Message).filter(Message.conversation_id == conv_id).order_by(Message.created_at.asc()).all()
+    messages = await run_in_threadpool(_load_history, db, conv_id)
     for m in messages[:-1]: # Exclude the user message we just added
         history.append({"role": m.role, "content": m.content})
 
     # Set conversation title dynamically if it is default
-    if conv.title == "New Conversation":
-        # First 4 words of the query
-        conv.title = " ".join(query.split()[:4]) + "..."
-        db.commit()
+    await run_in_threadpool(_maybe_set_title, db, conv, query)
 
     async def event_generator():
         # RAGEngine.stream_response is a *synchronous* generator (the
@@ -156,6 +210,8 @@ async def stream_chat_response(
         queue: asyncio.Queue = asyncio.Queue()
         chunks_out: List[Dict[str, Any]] = []
         DONE = object()
+        generation_start = time.perf_counter()
+        first_token_at = None
 
         def producer():
             try:
@@ -177,6 +233,12 @@ async def stream_chat_response(
         while True:
             kind, payload = await queue.get()
             if kind == "content":
+                if first_token_at is None:
+                    first_token_at = time.perf_counter()
+                    logger.info(
+                        f"[timing] chat.time_to_first_token duration_ms="
+                        f"{(first_token_at - generation_start) * 1000:.1f} conv_id={conv_id}"
+                    )
                 full_text_parts.append(payload)
                 data = {"type": "content", "delta": payload}
                 yield f"data: {json.dumps(data)}\n\n"
@@ -201,6 +263,11 @@ async def stream_chat_response(
             elif kind is DONE:
                 break
 
+        logger.info(
+            f"[timing] chat.total_generation duration_ms="
+            f"{(time.perf_counter() - generation_start) * 1000:.1f} conv_id={conv_id}"
+        )
+
         if disconnected:
             logger.info(f"Client disconnected mid-stream for conversation {conv_id}; skipping citation save.")
             return
@@ -208,32 +275,8 @@ async def stream_chat_response(
         response_text = "".join(full_text_parts) or "An error occurred while generating the response."
         citations = RAGEngine.build_citations(response_text, chunks_out)
 
-        # Save assistant message
-        assistant_msg = Message(
-            conversation_id=conv_id,
-            role=MessageRole.ASSISTANT,
-            content=response_text,
-            citations=citations
-        )
-        db.add(assistant_msg)
-        db.commit()
-        db.refresh(assistant_msg)
-
-        # Also persist a durable, joinable Citation row per citation (e.g.
-        # "which chunks get cited most"). Additive alongside the JSON
-        # `citations` column above, which stays the fast denormalized read
-        # path for the chat UI. `chunk_id` may be None if the citation's
-        # source chunk couldn't be resolved back to a DB row.
-        if citations:
-            db.bulk_save_objects([
-                Citation(
-                    message_id=assistant_msg.id,
-                    chunk_id=citation.get("chunk_id"),
-                    rank=rank
-                )
-                for rank, citation in enumerate(citations)
-            ])
-            db.commit()
+        assistant_msg = await run_in_threadpool(_save_assistant_message, db, conv_id, response_text, citations)
+        await run_in_threadpool(_save_citations, db, conv_id, assistant_msg.id, citations)
 
         # Send citations and DB IDs so frontend can display clickable sources and submit feedback
         data = {

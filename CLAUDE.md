@@ -1036,3 +1036,99 @@ discarding, or building on them.
   here.
 - Phase 7b (component extraction, test-writing) is a separate,
   not-yet-started phase.
+
+### 2026-07-13 — Performance audit: chat response latency
+
+User-reported "very high latency" on the local dev server. Full
+methodology, raw before/after numbers, and analysis live in
+`backend/PERFORMANCE_AUDIT.md` — summary here.
+
+**Headline finding**: the dominant cost by far (17-58s time-to-first-token
+across repeated test calls, vs. 350ms-2s for everything else combined) is
+**Gemini's own response latency** (`rag_engine.py`'s `_stream_gemini`/
+`_call_llm_cascade`, model `gemini-3.5-flash`, no request timeout
+configured), not local infrastructure. Only `GEMINI_API_KEY` was populated
+in `.env` (`OPENAI_API_KEY`/`ANTHROPIC_API_KEY` empty), so the existing
+provider fallback cascade had nowhere to fail over to. **This remains open**
+— needs real OpenAI/Anthropic keys (not available in this session) plus an
+explicit Gemini request timeout; see `PERFORMANCE_AUDIT.md` for detail.
+This is the single biggest remaining lever, larger than everything fixed
+below combined.
+
+**Fixed and verified against the real running server** (not just code
+review — added permanent timing instrumentation first, then drove the
+live server with real HTTP requests):
+
+- **Event-loop-blocking DB/file calls** (`backend/app/api/chat.py`'s
+  `stream_chat_response`, `backend/app/core/security.py`'s
+  `get_current_user` — a dependency on every authenticated route,
+  `backend/app/api/documents.py`'s `upload_document`): these were `async
+  def` routes making blocking synchronous SQLAlchemy/file-I/O calls
+  directly on the event loop. Since local dev runs single-process/
+  single-worker, any one of these calls froze the entire server for every
+  concurrent user, not just the requesting one. Fixed by extracting each
+  blocking call into a named helper and wrapping it in
+  `starlette.concurrency.run_in_threadpool`. Verified empirically: fired
+  two concurrent chat streams and probed `GET /` 15 times during their
+  DB-bookkeeping phases — flat 60-120ms the whole time, no stalls (see
+  `PERFORMANCE_AUDIT.md` for the raw numbers).
+- **`backend/app/core/database.py`**: added `pool_pre_ping=True`,
+  `pool_recycle=1800`, explicit `pool_size`/`max_overflow` for non-SQLite
+  URLs (previously zero pool tuning against a remote-over-internet
+  Postgres).
+- **`backend/app/services/supabase_db.py`** (prod-live, `render.yaml`
+  still uses `VECTOR_DB_BACKEND=supabase`): replaced a single shared raw
+  `psycopg2` connection (not safe for concurrent use) with a
+  `psycopg2.pool.ThreadedConnectionPool`, borrow/return per operation,
+  public method signatures unchanged. **Caught a real bug during
+  verification**: the first lock-free implementation had a check-then-set
+  race — an 8-thread concurrency smoke test showed 8 separate pools
+  getting created (7 leaked) instead of 1. Fixed with a
+  `threading.Lock` + double-checked locking; re-verified with the same
+  test, exactly 1 pool created.
+- **Eager embedding-model warm-up**: `EmbeddingsService.warm_up()` (new),
+  called from a `lifespan` handler in `backend/app/main.py` (replacing the
+  old import-time-only startup logic) instead of loading the local
+  SentenceTransformer model lazily on the first chat request. Previously
+  every process start (including every `--reload` restart in dev) made
+  the *next* user-facing chat request pay a ~10s model-load cost inline.
+  Verified via server log: model now loads during startup, before the app
+  accepts requests.
+- **`backend/app/api/admin.py`**: consolidated `get_document_analytics`
+  (5→4 queries) and `get_conversation_analytics` (5→3 queries, combining
+  total/positive/negative feedback counts into one conditional-aggregation
+  query). Verified both endpoints still return correct data.
+- **New `backend/app/core/timing.py`** + a request-timing middleware in
+  `main.py` + named phases through the chat/`hybrid_search` hot path:
+  there was no request-latency visibility anywhere before this. Kept
+  permanently (negligible overhead), not removed after use.
+
+**Attempted, reverted**: switching local dev off remote Supabase onto the
+already-provisioned local `docker-compose.yml` Postgres + Qdrant, to
+eliminate public-internet round-trip latency. `backend/app/core/config.py`
+gained `QDRANT_HOST`/`QDRANT_PORT` fields (previously missing entirely —
+`vector_db.py` referenced them but `Settings` never declared them, which
+would have crashed on first Qdrant call; kept, since they're harmless and
+needed for any future attempt). Reverted because Docker Desktop's WSL2
+backend is broken on this machine (`wsl -l -v` shows zero installed
+distributions; `wsl --update` didn't fix it; proper diagnosis needs
+admin-elevated PowerShell not available in this session) — and because the
+baseline measurement showed the marginal benefit was small anyway (350-
+600ms warm `hybrid_search` against remote Supabase vs. Gemini's 17-58s
+dominating). `backend/.env` has the revert documented inline for a future
+attempt once Docker/WSL is fixed.
+
+Verified: `backend\venv\Scripts\python.exe -m pytest backend\tests\test_basic.py -q`
+(3/3 pass), manual smoke test (login, create conversation, single chat
+query, 2 concurrent chat streams, document upload + background ingestion
++ delete, both admin analytics endpoints) against the live server.
+
+**Follow-ups for later phases**:
+- Gemini latency/timeout/fallback-keys (see "Headline finding" above) —
+  the priority follow-up.
+- Local Postgres/Qdrant cutover — blocked on Docker/WSL repair on this
+  machine, low priority given measured marginal benefit.
+- Not investigated: why Gemini's own latency is so variable (17-58s
+  across near-identical short prompts) — API tier/quota, region, or model
+  choice (`gemini-3.5-flash`) are candidates; worth checking directly with
+  the provider.

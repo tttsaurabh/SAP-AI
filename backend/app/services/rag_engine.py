@@ -1,10 +1,12 @@
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any, Tuple
 from loguru import logger
 from sqlalchemy import func, tuple_
 from sqlalchemy.orm import Session
 from app.core.config import settings
+from app.core.timing import phase
 from app.models.models import Chunk, Document
 from app.services.vector_db import get_vector_backend
 from app.services.reranker import Reranker
@@ -83,25 +85,33 @@ class RAGEngine:
            fields (chunk_id/page_number/section_header) stay pinned to the
            child. Legacy flat chunks (no parent) keep their own text.
         """
+        hybrid_search_start = time.perf_counter()
         # 1. Query Expansion
         expanded_query = RAGEngine.expand_query(query)
         logger.info(f"Executing hybrid search for query: '{query}' (Expanded: '{expanded_query}')")
 
         vector_backend = get_vector_backend()
 
+        def _timed_vector_search():
+            start = time.perf_counter()
+            result = vector_backend.search_similarity(collection_name, expanded_query, limit * 3)
+            logger.info(f"[timing] hybrid_search.vector_leg duration_ms={(time.perf_counter() - start) * 1000:.1f}")
+            return result
+
         # 2-3. Parallelize the two independent retrieval legs (Phase 8a).
         with ThreadPoolExecutor(max_workers=1) as executor:
-            vector_future = executor.submit(
-                vector_backend.search_similarity, collection_name, expanded_query, limit * 3
-            )
+            vector_future = executor.submit(_timed_vector_search)
+            kw_start = time.perf_counter()
             keyword_results = RAGEngine._db_keyword_search(db, collection_name, expanded_query, limit=limit * 3)
+            logger.info(f"[timing] hybrid_search.keyword_leg duration_ms={(time.perf_counter() - kw_start) * 1000:.1f}")
             semantic_results = vector_future.result()
 
         # Batched resolution of chunk_id/chunk_index for any semantic hit
         # whose vector payload doesn't carry them (legacy vectors upserted
         # before Phase 8a added the fields) -- one query for the whole
         # batch instead of one query per hit.
-        RAGEngine._resolve_missing_chunk_ids(db, semantic_results)
+        with phase("hybrid_search.resolve_missing_chunk_ids"):
+            RAGEngine._resolve_missing_chunk_ids(db, semantic_results)
 
         # 4. Reciprocal Rank Fusion (RRF)
         # RRF formula: RRF_score = sum(1 / (k + rank)) where k = 60
@@ -143,6 +153,7 @@ class RAGEngine:
             rrf_scores[key]["score"] += 1.0 / (k + rank + 1)
 
         # 5. Sort and Deduplicate / Compress
+        rrf_start = time.perf_counter()
         sorted_hits = sorted(rrf_scores.values(), key=lambda x: x["score"], reverse=True)
 
         # When reranking is enabled, fuse a wider candidate pool (e.g.
@@ -170,13 +181,21 @@ class RAGEngine:
         # RERANK_ENABLED is false, so this call is always safe to make; the
         # fusion_limit widening above is the only actual behavior gated on
         # the flag.
+        logger.info(f"[timing] hybrid_search.rrf_fusion duration_ms={(time.perf_counter() - rrf_start) * 1000:.1f}")
+
+        rerank_start = time.perf_counter()
         final_results = Reranker.rerank(query, final_results)
         final_results = final_results[:limit]
+        logger.info(f"[timing] hybrid_search.rerank duration_ms={(time.perf_counter() - rerank_start) * 1000:.1f}")
 
         # 7. Small-to-big expansion (Phase 8b).
-        final_results = RAGEngine._expand_to_parents(db, final_results)
+        with phase("hybrid_search.expand_to_parents"):
+            final_results = RAGEngine._expand_to_parents(db, final_results)
 
         logger.info(f"Hybrid search returned {len(final_results)} fused, reranked, and expanded results")
+        logger.info(
+            f"[timing] hybrid_search.total duration_ms={(time.perf_counter() - hybrid_search_start) * 1000:.1f}"
+        )
         return final_results
 
     @staticmethod
@@ -416,7 +435,10 @@ ASSISTANT RESPONSE:"""
                 try:
                     genai.configure(api_key=settings.GEMINI_API_KEY)
                     model = genai.GenerativeModel('gemini-3.5-flash')
-                    response = model.generate_content(prompt)
+                    # request_options timeout so a slow/hung Gemini call fails
+                    # over to the next provider instead of hanging ~20-60s
+                    # (see backend/PERFORMANCE_AUDIT.md).
+                    response = model.generate_content(prompt, request_options={"timeout": 20})
                     response_text = response.text
                 except Exception as e:
                     logger.error(f"Gemini generation failed: {str(e)}")
@@ -427,7 +449,7 @@ ASSISTANT RESPONSE:"""
         if not response_text and settings.OPENAI_API_KEY:
             if OpenAI:
                 try:
-                    client = OpenAI(api_key=settings.OPENAI_API_KEY)
+                    client = OpenAI(api_key=settings.OPENAI_API_KEY, timeout=20.0, max_retries=1)
                     response = client.chat.completions.create(
                         model="gpt-4o-mini",
                         messages=[{"role": "user", "content": prompt}],
@@ -441,9 +463,9 @@ ASSISTANT RESPONSE:"""
         if not response_text and settings.ANTHROPIC_API_KEY:
             if anthropic:
                 try:
-                    client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+                    client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY, timeout=20.0, max_retries=1)
                     message = client.messages.create(
-                        model="claude-3-5-sonnet-20240620",
+                        model="claude-sonnet-5",
                         max_tokens=2000,
                         temperature=0.0,
                         messages=[{"role": "user", "content": prompt}]
@@ -512,7 +534,7 @@ ASSISTANT RESPONSE:"""
 
     @staticmethod
     def _stream_openai(prompt: str):
-        client = OpenAI(api_key=settings.OPENAI_API_KEY)
+        client = OpenAI(api_key=settings.OPENAI_API_KEY, timeout=20.0, max_retries=1)
         stream = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
@@ -529,9 +551,9 @@ ASSISTANT RESPONSE:"""
 
     @staticmethod
     def _stream_anthropic(prompt: str):
-        client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+        client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY, timeout=20.0, max_retries=1)
         with client.messages.stream(
-            model="claude-3-5-sonnet-20240620",
+            model="claude-sonnet-5",
             max_tokens=2000,
             temperature=0.0,
             messages=[{"role": "user", "content": prompt}],

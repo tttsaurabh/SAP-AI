@@ -45,10 +45,13 @@ def get_document_analytics(
     db: Session = Depends(get_db),
     current_user: User = Depends(consultant_or_above)
 ):
-    total_docs = db.query(Document).count()
+    # total_docs/total_size are both against Document -- one round trip
+    # instead of two (each extra round trip matters more against a remote
+    # DB, see backend/PERFORMANCE_AUDIT.md).
+    total_docs, total_size = db.query(func.count(Document.id), func.sum(Document.file_size)).one()
+    total_size = total_size or 0
     total_chunks = db.query(Chunk).count()
-    total_size = db.query(func.sum(Document.file_size)).scalar() or 0
-    
+
     # Status count
     status_results = db.query(Document.status, func.count(Document.id)).group_by(Document.status).all()
     status_counts = {status: count for status, count in status_results}
@@ -72,10 +75,14 @@ def get_conversation_analytics(
 ):
     total_convs = db.query(Conversation).count()
     total_msgs = db.query(Message).count()
-    total_feedbacks = db.query(Feedback).count()
-    
-    pos_feedbacks = db.query(Feedback).filter(Feedback.score == 1).count()
-    neg_feedbacks = db.query(Feedback).filter(Feedback.score == -1).count()
+
+    # total/positive/negative feedback counts combined into one conditional
+    # aggregation query instead of three (see backend/PERFORMANCE_AUDIT.md).
+    total_feedbacks, pos_feedbacks, neg_feedbacks = db.query(
+        func.count(Feedback.id),
+        func.count(Feedback.id).filter(Feedback.score == 1),
+        func.count(Feedback.id).filter(Feedback.score == -1),
+    ).one()
     
     return {
         "total_conversations": total_convs,

@@ -1,6 +1,7 @@
 import os
 import shutil
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, File, Form, status
+from starlette.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 from typing import List, Dict
 from loguru import logger
@@ -204,6 +205,39 @@ def process_document_ingestion(document_id: int, file_path: str, filename: str, 
         db.close()
 
 
+def _write_upload_file(file_path: str, file_obj) -> int:
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file_obj, buffer)
+    return os.path.getsize(file_path)
+
+def _prepare_collection(db: Session, collection_name: str, created_by: int) -> Collection:
+    # Get-or-create the Collection row for this collection name, and make
+    # sure the currently configured embedding model matches whatever this
+    # collection was first ingested with (fail loud instead of silently
+    # mixing embedding spaces in one vector index/namespace).
+    collection = _get_or_create_collection(db, collection_name, created_by=created_by)
+    _ensure_embedding_model_compatible(collection)
+    return collection
+
+def _create_document_row(
+    db: Session, filename: str, file_path: str, file_size: int,
+    collection_name: str, collection_id: int, ext: str
+) -> Document:
+    db_doc = Document(
+        filename=filename,
+        file_path=file_path,
+        file_size=file_size,
+        collection_name=collection_name,
+        collection_id=collection_id,
+        document_type=ext.replace(".", "").upper(),
+        status=DocumentStatus.PROCESSING,
+        total_chunks=0
+    )
+    db.add(db_doc)
+    db.commit()
+    db.refresh(db_doc)
+    return db_doc
+
 @router.post("/upload", response_model=DocumentResponse, status_code=status.HTTP_201_CREATED)
 async def upload_document(
     background_tasks: BackgroundTasks,
@@ -219,23 +253,20 @@ async def upload_document(
     os.makedirs(upload_dir, exist_ok=True)
     file_path = os.path.join(upload_dir, file.filename)
 
-    # Save file
+    # Save file. Blocking disk I/O and the DB calls below are all run off
+    # the event loop (run_in_threadpool) so a large upload can't stall every
+    # other concurrent request being served by this process (see
+    # backend/PERFORMANCE_AUDIT.md).
     try:
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        file_size = await run_in_threadpool(_write_upload_file, file_path, file.file)
     except Exception as e:
         logger.error(f"Failed to write file to disk: {str(e)}")
         raise HTTPException(status_code=500, detail=f"File save error: {str(e)}")
 
-    file_size = os.path.getsize(file_path)
     ext = os.path.splitext(file.filename)[1].lower()
 
-    # 0. Get-or-create the Collection row for this collection name, and make
-    # sure the currently configured embedding model matches whatever this
-    # collection was first ingested with (fail loud instead of silently
-    # mixing embedding spaces in one vector index/namespace).
-    collection = _get_or_create_collection(db, collection_name, created_by=current_user.id)
-    _ensure_embedding_model_compatible(collection)
+    # 0. Get-or-create the Collection row + embedding-model compatibility check.
+    collection = await run_in_threadpool(_prepare_collection, db, collection_name, current_user.id)
 
     # 1. Create Document in DB (fast path) -- parse/chunk/embed/upsert are
     # deferred to a BackgroundTask (process_document_ingestion below) so
@@ -244,19 +275,10 @@ async def upload_document(
     # visible in the UI right away with status=processing; the admin page
     # polls for the status transition to active/failed (see
     # frontend/app/admin/page.tsx).
-    db_doc = Document(
-        filename=file.filename,
-        file_path=file_path,
-        file_size=file_size,
-        collection_name=collection_name,
-        collection_id=collection.id,
-        document_type=ext.replace(".", "").upper(),
-        status=DocumentStatus.PROCESSING,
-        total_chunks=0
+    db_doc = await run_in_threadpool(
+        _create_document_row, db, file.filename, file_path, file_size,
+        collection_name, collection.id, ext
     )
-    db.add(db_doc)
-    db.commit()
-    db.refresh(db_doc)
 
     background_tasks.add_task(
         process_document_ingestion,

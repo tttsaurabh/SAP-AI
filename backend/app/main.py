@@ -1,9 +1,12 @@
 import os
+import time
+from contextlib import asynccontextmanager
 
 from alembic import command
 from alembic.config import Config as AlembicConfig
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 from loguru import logger
 
 from app.core.config import settings
@@ -11,6 +14,7 @@ from app.core.database import SessionLocal
 from app.core.security import get_password_hash
 from app.core.roles import Role
 from app.models.models import User
+from app.services.embeddings import EmbeddingsService
 from app.api import auth, documents, chat, admin, sap_agentic
 
 # Path to backend/alembic.ini, regardless of the process's current working directory.
@@ -59,11 +63,21 @@ try:
 except Exception as e:
     logger.exception(f"Database schema initialization failed: {str(e)}")
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Warm the local embedding model at process startup instead of paying
+    # its multi-second load cost inline on the first user's chat request
+    # (see backend/PERFORMANCE_AUDIT.md). run_in_threadpool so this doesn't
+    # block anything else during startup any more than necessary.
+    await run_in_threadpool(EmbeddingsService.warm_up)
+    yield
+
 # Create FastAPI Instance
 app = FastAPI(
     title=settings.APP_NAME,
     description="Enterprise RAG Assistant trained on custom SAP knowledge documentation.",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 # Set CORS middleware
@@ -79,6 +93,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.middleware("http")
+async def log_request_timing(request: Request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    duration_ms = (time.perf_counter() - start) * 1000
+    logger.info(
+        f"[timing] request duration_ms={duration_ms:.1f} "
+        f"method={request.method} path={request.url.path} status={response.status_code}"
+    )
+    return response
 
 # Register routes
 app.include_router(auth.router)

@@ -4,6 +4,7 @@ from jose import jwt, JWTError
 from passlib.context import CryptContext
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
+from starlette.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.database import get_db
@@ -38,6 +39,9 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     encoded_jwt = jwt.encode(to_encode, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
     return encoded_jwt
 
+def _load_user_by_email(db: Session, email: str) -> Optional[User]:
+    return db.query(User).filter(User.email == email).first()
+
 async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -51,8 +55,11 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
             raise credentials_exception
     except JWTError:
         raise credentials_exception
-        
-    user = db.query(User).filter(User.email == email).first()
+
+    # This is a dependency on every authenticated route (including the chat
+    # stream endpoint); running the DB lookup off the event loop keeps a slow
+    # DB round trip from stalling every other concurrent request.
+    user = await run_in_threadpool(_load_user_by_email, db, email)
     if user is None:
         raise credentials_exception
     if not user.is_active:

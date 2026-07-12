@@ -25,6 +25,25 @@ class EmbeddingsService:
     _local_model = None
 
     @classmethod
+    def warm_up(cls) -> None:
+        """
+        Eagerly load the local SentenceTransformer model at process startup
+        instead of lazily on the first request. Without this, the first
+        chat query after every process start (including every `--reload`
+        restart in dev) pays the multi-second model-load cost inline as
+        part of that user-facing request (see backend/PERFORMANCE_AUDIT.md).
+        No-op when a remote embedding provider is configured -- there's
+        nothing local to warm.
+        """
+        if not settings.EMBEDDING_MODEL.startswith("local:"):
+            return
+        try:
+            cls.get_embeddings("warm up")
+            logger.info("EmbeddingsService: local model warmed up at startup.")
+        except Exception as e:
+            logger.warning(f"EmbeddingsService warm-up failed (will retry lazily on first request): {e}")
+
+    @classmethod
     def get_embedding_dimension(cls) -> int:
         model_setting = settings.EMBEDDING_MODEL
         if model_setting.startswith("openai:"):

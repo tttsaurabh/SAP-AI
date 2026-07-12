@@ -13,6 +13,8 @@ Requires:
 """
 
 import time
+import threading
+from contextlib import contextmanager
 from typing import List, Dict, Any, Optional
 from loguru import logger
 from app.core.config import settings
@@ -21,6 +23,7 @@ from app.services.embeddings import EmbeddingsService
 try:
     import psycopg2
     import psycopg2.extras
+    import psycopg2.pool
 except ImportError:
     psycopg2 = None
 
@@ -41,7 +44,8 @@ class SupabaseDBService:
     - Table: document_vectors (created via supabase_setup.sql)
     """
     
-    _conn = None
+    _pool: Optional["psycopg2.pool.ThreadedConnectionPool"] = None
+    _pool_lock = threading.Lock()
     _supabase: Optional["SupabaseClient"] = None
 
     # ------------------------------------------------------------------ #
@@ -49,25 +53,53 @@ class SupabaseDBService:
     # ------------------------------------------------------------------ #
 
     @classmethod
-    def get_connection(cls):
-        """Get or create a psycopg2 connection to Supabase PostgreSQL."""
-        if cls._conn is None or cls._conn.closed:
-            db_url = settings.SUPABASE_DB_URL or settings.DATABASE_URL
-            if not db_url or "YOUR_PROJECT_ID" in db_url:
-                raise ValueError(
-                    "SUPABASE_DB_URL is not configured. "
-                    "Set it in .env: postgresql://postgres:PASSWORD@db.PROJECT_ID.supabase.co:5432/postgres"
-                )
-            if psycopg2 is None:
-                raise ImportError("psycopg2-binary not installed. Run: pip install psycopg2-binary")
-            
-            try:
-                cls._conn = psycopg2.connect(db_url)
-                cls._conn.autocommit = True
-                logger.info("Connected to Supabase PostgreSQL (pgvector).")
-            except Exception as e:
-                raise ConnectionError(f"Failed to connect to Supabase PostgreSQL: {e}") from e
-        return cls._conn
+    def _get_pool(cls) -> "psycopg2.pool.ThreadedConnectionPool":
+        """
+        Get or create the process-wide psycopg2 connection pool to Supabase
+        PostgreSQL. Previously this held a single shared raw connection
+        (`_conn`) reused across every call/thread -- psycopg2 connections
+        aren't safe for concurrent use, so concurrent vector searches could
+        contend or interfere on that one connection. A small pool removes
+        that contention without changing any public method's behavior (see
+        backend/PERFORMANCE_AUDIT.md).
+
+        Guarded by a lock: the plain `if cls._pool is None` check-then-set
+        below is a classic race under concurrent first callers -- a
+        concurrency smoke test caught 8 threads each independently seeing
+        `None` and creating their own pool, leaking 7 of them (and their
+        open connections). The lock makes pool creation happen exactly
+        once.
+        """
+        if cls._pool is None:
+            with cls._pool_lock:
+                if cls._pool is None:  # re-check: another thread may have won the race
+                    db_url = settings.SUPABASE_DB_URL or settings.DATABASE_URL
+                    if not db_url or "YOUR_PROJECT_ID" in db_url:
+                        raise ValueError(
+                            "SUPABASE_DB_URL is not configured. "
+                            "Set it in .env: postgresql://postgres:PASSWORD@db.PROJECT_ID.supabase.co:5432/postgres"
+                        )
+                    if psycopg2 is None:
+                        raise ImportError("psycopg2-binary not installed. Run: pip install psycopg2-binary")
+
+                    try:
+                        cls._pool = psycopg2.pool.ThreadedConnectionPool(2, 10, dsn=db_url)
+                        logger.info("Created Supabase PostgreSQL connection pool (pgvector).")
+                    except Exception as e:
+                        raise ConnectionError(f"Failed to connect to Supabase PostgreSQL: {e}") from e
+        return cls._pool
+
+    @classmethod
+    @contextmanager
+    def _borrowed_connection(cls):
+        """Borrow a pooled connection for the duration of one operation, then return it."""
+        pool = cls._get_pool()
+        conn = pool.getconn()
+        conn.autocommit = True
+        try:
+            yield conn
+        finally:
+            pool.putconn(conn)
 
     @classmethod
     def get_supabase_client(cls) -> "SupabaseClient":
@@ -91,10 +123,9 @@ class SupabaseDBService:
         Create document_vectors table with pgvector if it doesn't exist.
         Run supabase_setup.sql in Supabase SQL Editor for proper index setup.
         """
-        conn = cls.get_connection()
         dim = settings.EMBEDDING_DIMENSION
         table = settings.SUPABASE_VECTOR_TABLE
-        with conn.cursor() as cur:
+        with cls._borrowed_connection() as conn, conn.cursor() as cur:
             # Enable pgvector extension
             cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
             # Create vectors table
@@ -135,7 +166,6 @@ class SupabaseDBService:
         Uses INSERT ... ON CONFLICT (vector_id) DO UPDATE for idempotent upserts.
         """
         cls.ensure_table_exists()
-        conn = cls.get_connection()
         table = settings.SUPABASE_VECTOR_TABLE
 
         texts = [c["text"] for c in chunks]
@@ -175,7 +205,7 @@ class SupabaseDBService:
                 chunk_index     = EXCLUDED.chunk_index;
         """
 
-        with conn.cursor() as cur:
+        with cls._borrowed_connection() as conn, conn.cursor() as cur:
             for start in range(0, len(rows), batch_size):
                 batch = rows[start : start + batch_size]
                 psycopg2.extras.execute_batch(cur, upsert_sql, batch)
@@ -205,7 +235,6 @@ class SupabaseDBService:
         Performs cosine similarity search using pgvector <=> operator.
         Filters by collection_name and optionally by document_id.
         """
-        conn = cls.get_connection()
         table = settings.SUPABASE_VECTOR_TABLE
 
         query_vector = EmbeddingsService.get_embeddings(query)[0]
@@ -238,34 +267,35 @@ class SupabaseDBService:
             """
             params = (vec_literal, collection_name, vec_literal, limit)
 
-        try:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute(sql, params)
-                rows = cur.fetchall()
+        with cls._borrowed_connection() as conn:
+            try:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute(sql, params)
+                    rows = cur.fetchall()
 
-            results = []
-            for row in rows:
-                results.append({
-                    "score": float(row["score"]),
-                    "text": row["chunk_text"],
-                    "document_id": row["document_id"],
-                    "filename": row["filename"],
-                    "page_number": row["page_number"],
-                    "section_header": row["section_header"],
-                    "collection_name": row["collection_name"],
-                    "chunk_id": row.get("chunk_id"),
-                    "chunk_index": row.get("chunk_index"),
-                })
+                results = []
+                for row in rows:
+                    results.append({
+                        "score": float(row["score"]),
+                        "text": row["chunk_text"],
+                        "document_id": row["document_id"],
+                        "filename": row["filename"],
+                        "page_number": row["page_number"],
+                        "section_header": row["section_header"],
+                        "collection_name": row["collection_name"],
+                        "chunk_id": row.get("chunk_id"),
+                        "chunk_index": row.get("chunk_index"),
+                    })
 
-            logger.info(
-                f"Supabase pgvector search in '{collection_name}' "
-                f"returned {len(results)} results."
-            )
-            return results
+                logger.info(
+                    f"Supabase pgvector search in '{collection_name}' "
+                    f"returned {len(results)} results."
+                )
+                return results
 
-        except Exception as e:
-            logger.error(f"Supabase pgvector search failed: {e}")
-            return []
+            except Exception as e:
+                logger.error(f"Supabase pgvector search failed: {e}")
+                return []
 
     # ------------------------------------------------------------------ #
     #  Delete document vectors                                             #
@@ -276,20 +306,20 @@ class SupabaseDBService:
         """
         Deletes all vector rows for a given document_id from Supabase.
         """
-        conn = cls.get_connection()
         table = settings.SUPABASE_VECTOR_TABLE
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"DELETE FROM {table} WHERE document_id = %s AND collection_name = %s;",
-                    (document_id, collection_name),
+        with cls._borrowed_connection() as conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"DELETE FROM {table} WHERE document_id = %s AND collection_name = %s;",
+                        (document_id, collection_name),
+                    )
+                logger.info(
+                    f"Deleted Supabase vectors for document_id={document_id} "
+                    f"in collection '{collection_name}'."
                 )
-            logger.info(
-                f"Deleted Supabase vectors for document_id={document_id} "
-                f"in collection '{collection_name}'."
-            )
-        except Exception as e:
-            logger.error(f"Supabase vector delete failed: {e}")
+            except Exception as e:
+                logger.error(f"Supabase vector delete failed: {e}")
 
     # ------------------------------------------------------------------ #
     #  Health check                                                        #
@@ -299,9 +329,8 @@ class SupabaseDBService:
     def health_check(cls) -> Dict[str, Any]:
         """Returns connection status and row count for monitoring."""
         try:
-            conn = cls.get_connection()
             table = settings.SUPABASE_VECTOR_TABLE
-            with conn.cursor() as cur:
+            with cls._borrowed_connection() as conn, conn.cursor() as cur:
                 cur.execute(f"SELECT COUNT(*) FROM {table};")
                 count = cur.fetchone()[0]
             return {"status": "healthy", "vector_rows": count, "backend": "supabase_pgvector"}
