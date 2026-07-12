@@ -434,24 +434,28 @@ ASSISTANT RESPONSE:"""
             if genai:
                 try:
                     genai.configure(api_key=settings.GEMINI_API_KEY)
-                    model = genai.GenerativeModel('gemini-3.5-flash')
-                    # request_options timeout so a slow/hung Gemini call fails
-                    # over to the next provider instead of hanging ~20-60s
-                    # (see backend/PERFORMANCE_AUDIT.md).
-                    response = model.generate_content(prompt, request_options={"timeout": 20})
+                    model = genai.GenerativeModel(settings.GEMINI_MODEL)
+                    # request_options timeout and disabled retry so a slow/hung Gemini call fails
+                    # over to the next provider instantly instead of hanging/retrying.
+                    response = model.generate_content(
+                        prompt, 
+                        request_options={"timeout": settings.LLM_TIMEOUT_SECONDS, "retry": None}
+                    )
                     response_text = response.text
                 except Exception as e:
                     logger.error(f"Gemini generation failed: {str(e)}")
-            else:
-                logger.warning("google-generativeai module not imported.")
 
         # 2. Try OpenAI fallback
         if not response_text and settings.OPENAI_API_KEY:
             if OpenAI:
                 try:
-                    client = OpenAI(api_key=settings.OPENAI_API_KEY, timeout=20.0, max_retries=1)
+                    client = OpenAI(
+                        api_key=settings.OPENAI_API_KEY, 
+                        timeout=settings.LLM_TIMEOUT_SECONDS, 
+                        max_retries=0
+                    )
                     response = client.chat.completions.create(
-                        model="gpt-4o-mini",
+                        model=settings.OPENAI_MODEL,
                         messages=[{"role": "user", "content": prompt}],
                         temperature=0.0
                     )
@@ -463,9 +467,13 @@ ASSISTANT RESPONSE:"""
         if not response_text and settings.ANTHROPIC_API_KEY:
             if anthropic:
                 try:
-                    client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY, timeout=20.0, max_retries=1)
+                    client = anthropic.Anthropic(
+                        api_key=settings.ANTHROPIC_API_KEY, 
+                        timeout=settings.LLM_TIMEOUT_SECONDS, 
+                        max_retries=0
+                    )
                     message = client.messages.create(
-                        model="claude-sonnet-5",
+                        model=settings.ANTHROPIC_MODEL,
                         max_tokens=2000,
                         temperature=0.0,
                         messages=[{"role": "user", "content": prompt}]
@@ -519,8 +527,12 @@ ASSISTANT RESPONSE:"""
     @staticmethod
     def _stream_gemini(prompt: str):
         genai.configure(api_key=settings.GEMINI_API_KEY)
-        model = genai.GenerativeModel('gemini-3.5-flash')
-        response = model.generate_content(prompt, stream=True)
+        model = genai.GenerativeModel(settings.GEMINI_MODEL)
+        response = model.generate_content(
+            prompt, 
+            stream=True, 
+            request_options={"timeout": settings.LLM_TIMEOUT_SECONDS, "retry": None}
+        )
         for chunk in response:
             # `.text` is a computed property that can raise (e.g. a chunk
             # with no parts, such as a safety-filtered piece) -- skip a bad
@@ -534,9 +546,13 @@ ASSISTANT RESPONSE:"""
 
     @staticmethod
     def _stream_openai(prompt: str):
-        client = OpenAI(api_key=settings.OPENAI_API_KEY, timeout=20.0, max_retries=1)
+        client = OpenAI(
+            api_key=settings.OPENAI_API_KEY, 
+            timeout=settings.LLM_TIMEOUT_SECONDS, 
+            max_retries=0
+        )
         stream = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=settings.OPENAI_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
             stream=True,
@@ -551,9 +567,13 @@ ASSISTANT RESPONSE:"""
 
     @staticmethod
     def _stream_anthropic(prompt: str):
-        client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY, timeout=20.0, max_retries=1)
+        client = anthropic.Anthropic(
+            api_key=settings.ANTHROPIC_API_KEY, 
+            timeout=settings.LLM_TIMEOUT_SECONDS, 
+            max_retries=0
+        )
         with client.messages.stream(
-            model="claude-sonnet-5",
+            model=settings.ANTHROPIC_MODEL,
             max_tokens=2000,
             temperature=0.0,
             messages=[{"role": "user", "content": prompt}],

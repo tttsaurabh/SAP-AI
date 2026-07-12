@@ -41,3 +41,7 @@ git/
 
 # Large source PDFs (kept locally, not pushed to GitHub)
 public/
+
+# Temporary scratch files
+scratch/
+backend/scratch/

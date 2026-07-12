@@ -31,8 +31,16 @@ services:
         sync: false
       - key: GEMINI_API_KEY
         sync: false
+      - key: GEMINI_MODEL
+        value: "gemini-3.1-flash-lite"
       - key: OPENAI_API_KEY
         sync: false
+      - key: OPENAI_MODEL
+        value: "gpt-4o-mini"
+      - key: ANTHROPIC_MODEL
+        value: "claude-3-5-sonnet-latest"
+      - key: LLM_TIMEOUT_SECONDS
+        value: "10.0"
       - key: ANTHROPIC_API_KEY
         sync: false
       - key: UPLOADS_DIR
