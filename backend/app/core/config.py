@@ -38,13 +38,13 @@ class Settings(BaseSettings):
     # LLM Models and Timeouts
     GEMINI_MODEL: str = "gemini-2.0-flash-lite"
     OPENAI_MODEL: str = "gpt-4o-mini"
-    ANTHROPIC_MODEL: str = "claude-3-5-sonnet-latest"
+    ANTHROPIC_MODEL: str = "claude-3-haiku-20240307"
     LLM_TIMEOUT_SECONDS: float = 25.0
     
     # Ingestion Configurations
     UPLOADS_DIR: str = "./uploads"
     OCR_ENABLED: bool = False
-    EMBEDDING_MODEL: str = "gemini:text-embedding-004"
+    EMBEDDING_MODEL: str = "local:sentence-transformers/all-MiniLM-L6-v2"
     RERANK_ENABLED: bool = False
     RERANK_MODEL: str = ""
 
@@ -70,7 +70,7 @@ class Settings(BaseSettings):
     
     # Supabase pgvector table name
     SUPABASE_VECTOR_TABLE: str = "document_vectors"
-    # Embedding dimension (384 for all-MiniLM-L6-v2, 1536 for OpenAI text-embedding-ada-002)
+    # Embedding dimension (768 for Gemini text-embedding-004, 384 for all-MiniLM-L6-v2, 1536 for OpenAI text-embedding-ada-002)
     EMBEDDING_DIMENSION: int = 384
 
     # PDF Parser Engine
