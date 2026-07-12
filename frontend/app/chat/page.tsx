@@ -698,7 +698,7 @@ export default function ChatPage() {
                   </div>
                   {selectedCitation.text ? (
                     <p className="italic text-slate-300 leading-relaxed font-mono text-xs">
-                      "{selectedCitation.text}"
+                      &quot;{selectedCitation.text}&quot;
                     </p>
                   ) : (
                     <p className="italic text-slate-500 leading-relaxed font-mono text-xs">
