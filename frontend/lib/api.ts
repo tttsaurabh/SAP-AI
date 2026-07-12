@@ -63,6 +63,127 @@ export interface ChunkInfo {
   chunk_metadata: Record<string, any>;
 }
 
+// Admin analytics -- matches backend/app/schemas/schemas.py's
+// DocumentAnalytics / ConversationAnalytics response_model shapes exactly
+// (GET /api/admin/analytics/documents, /api/admin/analytics/conversations).
+export interface DocumentAnalytics {
+  total_documents: number;
+  total_chunks: number;
+  total_size_bytes: number;
+  status_counts: Record<string, number>;
+  collection_counts: Record<string, number>;
+}
+
+export interface ConversationAnalytics {
+  total_conversations: number;
+  total_messages: number;
+  total_feedbacks: number;
+  positive_feedbacks: number;
+  negative_feedbacks: number;
+}
+
+// SAP Agentic Workbench -- all six backend/app/api/sap_agentic.py endpoints
+// are SIMULATED/DEMO only (see CLAUDE.md), and every response includes
+// `simulated: true` as of Phase 6. Shapes below match
+// SAPAgenticService's return dicts in
+// backend/app/services/sap_agentic_service.py exactly -- no
+// response_model/Pydantic schema exists for these on the backend, so these
+// are hand-derived from the actual dict keys built there, not invented.
+
+export interface DumpAnalysisPipelineStep {
+  step: string;
+  status: string;
+  detail: string;
+}
+
+export interface DumpAnalysisResult {
+  exception: string;
+  program: string;
+  tcode: string;
+  attribution: string;
+  is_custom: boolean;
+  pipeline: DumpAnalysisPipelineStep[];
+  analysis_details: string;
+  recommendations: string[];
+  simulated: true;
+}
+
+export interface SapNoteDetails {
+  note_number: string;
+  title: string;
+  delivery_format: string;
+  modification_depth: string;
+  prerequisites: string[];
+  release_range: string;
+  manual_steps: string;
+  signed: boolean;
+}
+
+export interface NoteSearchResult {
+  found: boolean;
+  // Present only when found === false.
+  message?: string;
+  // Present only when found === true.
+  note_details?: SapNoteDetails;
+  low_release_warning?: boolean;
+  warning_message?: string;
+  simulated: true;
+}
+
+export interface AuthenticateNotesResult {
+  success: boolean;
+  // Present only when success === false (missing credentials).
+  message?: string;
+  // Present only when success === true.
+  status?: string;
+  session_cookie?: string;
+  cache_saved?: boolean;
+  simulated: true;
+}
+
+export interface AbapCodeViolation {
+  rule: string;
+  severity: "Critical" | "High" | "Medium";
+  message: string;
+}
+
+export interface ValidateCodeResult {
+  grade: "Level A" | "Level B" | "Level C" | "Level D";
+  status: string;
+  description: string;
+  violations: AbapCodeViolation[];
+  gates: {
+    offline_linter: string;
+    online_compilation: string;
+    unit_test_validation: string;
+  };
+  remediation_advice: string;
+  simulated: true;
+}
+
+export interface TransitionGuideStep {
+  id: number;
+  title: string;
+  action: string;
+  status: string;
+}
+
+export interface TransitionGuideResult {
+  steps: TransitionGuideStep[];
+  coexistence_checks: string[];
+  simulated: true;
+}
+
+export interface IntegrationSpecResult {
+  title: string;
+  pattern: string;
+  protocol: string;
+  adapter: string;
+  security: string;
+  steps: string[];
+  simulated: true;
+}
+
 // Token management helpers
 export const getAuthToken = () => {
   if (typeof window !== "undefined") {
@@ -253,12 +374,12 @@ export const api = {
     return res.json();
   },
 
-  getDocumentAnalytics: async (): Promise<any> => {
+  getDocumentAnalytics: async (): Promise<DocumentAnalytics> => {
     const res = await fetchClient("/admin/analytics/documents");
     return res.json();
   },
 
-  getConversationAnalytics: async (): Promise<any> => {
+  getConversationAnalytics: async (): Promise<ConversationAnalytics> => {
     const res = await fetchClient("/admin/analytics/conversations");
     return res.json();
   },
@@ -328,8 +449,9 @@ export const api = {
     }
   },
 
-  // Agentic Workbench Tools
-  analyzeDump: async (dumpText: string): Promise<any> => {
+  // Agentic Workbench Tools -- SIMULATED/DEMO only, see CLAUDE.md and the
+  // response-shape comment above DumpAnalysisResult.
+  analyzeDump: async (dumpText: string): Promise<DumpAnalysisResult> => {
     const res = await fetchClient("/sap-agentic/analyze-dump", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -338,7 +460,7 @@ export const api = {
     return res.json();
   },
 
-  searchNotes: async (noteNumber: string, sapBasisVersion: string): Promise<any> => {
+  searchNotes: async (noteNumber: string, sapBasisVersion: string): Promise<NoteSearchResult> => {
     const res = await fetchClient("/sap-agentic/search-notes", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -347,7 +469,7 @@ export const api = {
     return res.json();
   },
 
-  authenticateNotes: async (authMode: string, username?: string, password?: string): Promise<any> => {
+  authenticateNotes: async (authMode: string, username?: string, password?: string): Promise<AuthenticateNotesResult> => {
     const res = await fetchClient("/sap-agentic/authenticate-notes", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -356,7 +478,7 @@ export const api = {
     return res.json();
   },
 
-  validateCode: async (codeText: string): Promise<any> => {
+  validateCode: async (codeText: string): Promise<ValidateCodeResult> => {
     const res = await fetchClient("/sap-agentic/validate-code", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -365,14 +487,14 @@ export const api = {
     return res.json();
   },
 
-  getTransitionGuide: async (): Promise<any> => {
+  getTransitionGuide: async (): Promise<TransitionGuideResult> => {
     const res = await fetchClient("/sap-agentic/transition-guide", {
       method: "GET",
     });
     return res.json();
   },
 
-  getIntegrationSpec: async (targetSystem: string): Promise<any> => {
+  getIntegrationSpec: async (targetSystem: string): Promise<IntegrationSpecResult> => {
     const res = await fetchClient("/sap-agentic/integration-spec", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
