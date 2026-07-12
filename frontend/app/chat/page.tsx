@@ -6,7 +6,7 @@ import { api, getAuthToken, getUserRole, getUserEmail, clearAuthToken, Message, 
 import { 
   MessageSquare, Plus, LogOut, Send, Bot, User as UserIcon, BookOpen, 
   Settings, ThumbsUp, ThumbsDown, Copy, Download, Moon, Sun, 
-  ChevronRight, RefreshCw, X, FileText, Check, Terminal, Database
+  ChevronRight, RefreshCw, X, FileText, Check, Terminal, Database, ArrowDown, Search, Layers
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
@@ -23,6 +23,7 @@ export default function ChatPage() {
   const [selectedCollection, setSelectedCollection] = useState("Default");
   const [userEmail, setUserEmail] = useState("");
   const [userRole, setUserRole] = useState("End User");
+  const [sidebarSearch, setSidebarSearch] = useState("");
   
   // Feedback states
   const [feedbackMsgId, setFeedbackMsgId] = useState<number | null>(null);
@@ -33,14 +34,18 @@ export default function ChatPage() {
   const [selectedCitation, setSelectedCitation] = useState<Citation | null>(null);
   const [copiedId, setCopiedId] = useState<number | null>(null);
 
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  // FAB Scroll-to-bottom visibility
+  const [showScrollBottom, setShowScrollBottom] = useState(false);
 
-  // Suggested prompt chips
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+
+  // Suggested prompt chips with icons for high-end look
   const suggestions = [
-    "Explain MDG Change Request process.",
-    "What are the RAP components in ABAP?",
-    "Explain Business Partner conversion in S/4HANA.",
-    "How is a BADI defined in SAP?"
+    { text: "Explain MDG Change Request process.", desc: "Governance Workflow" },
+    { text: "What are the RAP components in ABAP?", desc: "Modern Programming Model" },
+    { text: "Explain Business Partner conversion in S/4HANA.", desc: "Data Migration" },
+    { text: "How is a BADI defined in SAP?", desc: "Extensibility Options" }
   ];
 
   useEffect(() => {
@@ -64,12 +69,19 @@ export default function ChatPage() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   };
 
+  // Monitor scrolling to toggle Scroll-to-Bottom FAB
+  const handleScroll = () => {
+    if (!scrollContainerRef.current) return;
+    const { scrollTop, scrollHeight, clientHeight } = scrollContainerRef.current;
+    // Show button if user is scrolled up by more than 400px
+    setShowScrollBottom(scrollHeight - scrollTop - clientHeight > 400);
+  };
+
   const loadConversations = async () => {
     try {
       const data = await api.getConversations();
       setConversations(data);
       if (data.length > 0 && !activeConv) {
-        // Load the most recent conversation by default
         loadConversationDetails(data[0].id);
       }
     } catch (err) {
@@ -122,80 +134,98 @@ export default function ChatPage() {
         }
       }
     } catch (err) {
-      console.error("Failed to delete chat", err);
+      console.error("Failed to delete conversation", err);
     }
   };
 
-  const handleSend = async (e?: React.FormEvent, promptText?: string) => {
+  const handleSend = async (e?: React.FormEvent, customQuery?: string) => {
     if (e) e.preventDefault();
-    const messageText = promptText || query;
-    if (!messageText.trim() || loading) return;
+    const queryText = customQuery || query;
+    if (!queryText.trim() || loading) return;
 
-    let currentConv = activeConv;
-    if (!currentConv) {
+    if (!activeConv) {
       try {
-        currentConv = await api.createConversation("New Conversation");
-        setConversations([currentConv, ...conversations]);
-        setActiveConv({ ...currentConv, messages: [] });
+        const data = await api.createConversation(queryText.slice(0, 30) + "...");
+        setConversations([data, ...conversations]);
+        setActiveConv({ ...data, messages: [] });
+        executeStream(data.id, queryText);
       } catch (err) {
         console.error("Failed to auto-create conversation", err);
-        return;
       }
+    } else {
+      executeStream(activeConv.id, queryText);
     }
-
-    const conversationId = currentConv.id;
     setQuery("");
-    setLoading(true);
+  };
 
-    // Optimistically push user message to UI
-    const updatedMessages = [...(currentConv.messages || [])];
-    const dummyUserMsg: Message = {
+  const executeStream = (convId: number, queryText: string) => {
+    setLoading(true);
+    
+    // Add user message immediately
+    const userMsg: Message = {
       id: Date.now(),
-      conversation_id: conversationId,
+      conversation_id: convId,
       role: "user",
-      content: messageText,
+      content: queryText,
       citations: [],
       created_at: new Date().toISOString()
     };
-    updatedMessages.push(dummyUserMsg);
     
-    // Add temporary loading message for assistant
-    const dummyAssistantMsg: Message = {
-      id: Date.now() + 1,
-      conversation_id: conversationId,
+    setActiveConv(prev => {
+      if (!prev) return null;
+      return {
+        ...prev,
+        messages: [...(prev.messages || []), userMsg]
+      };
+    });
+
+    // Setup temporary assistant message for stream update
+    const assistantMsgId = Date.now() + 1;
+    const tempAssistantMsg: Message = {
+      id: assistantMsgId,
+      conversation_id: convId,
       role: "assistant",
       content: "",
       citations: [],
       created_at: new Date().toISOString()
     };
-    updatedMessages.push(dummyAssistantMsg);
-    
-    setActiveConv({ ...currentConv, messages: updatedMessages });
 
-    // Begin SSE response stream
-    let contentAccumulator = "";
-    await api.streamResponse(
-      conversationId,
-      messageText,
+    setActiveConv(prev => {
+      if (!prev) return null;
+      return {
+        ...prev,
+        messages: [...(prev.messages || []), tempAssistantMsg]
+      };
+    });
+
+    let currentContent = "";
+    api.streamResponse(
+      convId,
+      queryText,
       selectedCollection,
-      // onContent chunk update
+      // onMessageChunk
       (chunk) => {
-        contentAccumulator += chunk;
+        currentContent += chunk;
         setActiveConv(prev => {
           if (!prev) return null;
-          const msgs = [...prev.messages!];
-          msgs[msgs.length - 1].content = contentAccumulator;
-          return { ...prev, messages: msgs };
+          return {
+            ...prev,
+            messages: (prev.messages || []).map(m => 
+              m.id === assistantMsgId ? { ...m, content: currentContent } : m
+            )
+          };
         });
       },
-      // onCitations complete update
-      (data) => {
+      // onCitations
+      ({ citations }) => {
         setActiveConv(prev => {
           if (!prev) return null;
-          const msgs = [...prev.messages!];
-          msgs[msgs.length - 1].id = data.message_id; // Set actual db id
-          msgs[msgs.length - 1].citations = data.citations;
-          return { ...prev, messages: msgs };
+          return {
+            ...prev,
+            messages: (prev.messages || []).map(m => 
+              m.id === assistantMsgId ? { ...m, citations } : m
+            )
+          };
         });
       },
       // onError
@@ -216,7 +246,6 @@ export default function ChatPage() {
     router.push("/auth");
   };
 
-  // Feedback actions
   const submitFeedback = async () => {
     if (!feedbackMsgId) return;
     try {
@@ -225,7 +254,6 @@ export default function ChatPage() {
         score: feedbackScore,
         comments: feedbackComment
       });
-      // Close and clear
       setFeedbackMsgId(null);
       setFeedbackComment("");
     } catch (err) {
@@ -233,7 +261,6 @@ export default function ChatPage() {
     }
   };
 
-  // Export functions
   const copyToClipboard = (text: string, id: number) => {
     navigator.clipboard.writeText(text);
     setCopiedId(id);
@@ -264,25 +291,32 @@ export default function ChatPage() {
   };
 
   const isAdminOrManager = ["Super Admin", "SAP Knowledge Manager"].includes(userRole);
+  
+  // Filter sidebar chats based on search query
+  const filteredConversations = conversations.filter(c => 
+    c.title.toLowerCase().includes(sidebarSearch.toLowerCase())
+  );
 
   return (
-    <div className="flex h-screen w-screen bg-[#05070e] text-[#f1f5f9] overflow-hidden">
+    <div className="flex h-screen w-screen bg-[#05070e] text-[#f1f5f9] overflow-hidden font-sans">
+      
       {/* Sidebar Panel */}
-      <div className="flex h-full w-80 flex-col border-r border-slate-800/80 bg-slate-950/75 backdrop-blur-xl">
+      <div className="flex h-full w-80 flex-col border-r border-slate-900 bg-slate-950/75 backdrop-blur-xl">
+        
         {/* User profile info header */}
-        <div className="flex items-center gap-3 border-b border-slate-800/60 p-4">
-          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-tr from-purple-600 to-indigo-500 shadow-md shadow-purple-600/10">
-            <Bot className="h-5 w-5 text-white" />
+        <div className="flex items-center gap-3 border-b border-slate-900/60 p-4">
+          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-tr from-blue-600 to-indigo-500 shadow-md shadow-indigo-500/10 border border-indigo-400/20">
+            <Layers className="h-5 w-5 text-white" />
           </div>
           <div className="flex-1 min-w-0">
             <p className="text-sm font-semibold truncate text-white">{userEmail || "Consultant"}</p>
-            <p className="text-xs font-medium text-slate-500">{userRole}</p>
+            <p className="text-[10px] font-bold text-indigo-400 uppercase tracking-wide">{userRole}</p>
           </div>
           <div className="flex items-center gap-1.5">
             <button 
               onClick={() => router.push("/workbench")}
               title="SAP Agentic Workbench"
-              className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-800 bg-slate-900/60 text-slate-400 hover:text-purple-400 hover:border-purple-500/35 transition-all"
+              className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-800 bg-slate-900/40 text-slate-400 hover:text-indigo-400 hover:border-indigo-500/35 transition-all"
             >
               <Terminal className="h-4 w-4" />
             </button>
@@ -290,7 +324,7 @@ export default function ChatPage() {
               <button 
                 onClick={() => router.push("/admin")}
                 title="Knowledge Base Admin Panel"
-                className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-800 bg-slate-900/60 text-slate-400 hover:text-purple-400 hover:border-purple-500/35 transition-all"
+                className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-800 bg-slate-900/40 text-slate-400 hover:text-indigo-400 hover:border-indigo-500/35 transition-all"
               >
                 <Settings className="h-4 w-4" />
               </button>
@@ -300,17 +334,22 @@ export default function ChatPage() {
 
         {/* Collection filter dropdown for Admin/Consultant */}
         {isAdminOrManager && (
-          <div className="p-4 border-b border-slate-800/40">
-            <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block mb-1.5">Active Knowledge Domain</label>
-            <select
-              value={selectedCollection}
-              onChange={(e) => setSelectedCollection(e.target.value)}
-              className="w-full text-xs font-medium rounded-lg bg-slate-900 border border-slate-800 text-slate-300 py-2.5 px-3 focus:outline-none focus:ring-1 focus:ring-purple-500"
-            >
-              {collections.map(c => (
-                <option key={c} value={c}>{c}</option>
-              ))}
-            </select>
+          <div className="p-4 border-b border-slate-900/50 bg-slate-950/20">
+            <label className="text-[9px] font-bold text-slate-500 uppercase tracking-widest block mb-1.5">Active Knowledge Domain</label>
+            <div className="relative">
+              <select
+                value={selectedCollection}
+                onChange={(e) => setSelectedCollection(e.target.value)}
+                className="w-full text-xs font-semibold rounded-lg bg-slate-900/70 border border-slate-800 text-slate-200 py-2.5 pl-3 pr-8 focus:outline-none focus:ring-1 focus:ring-indigo-500 appearance-none cursor-pointer"
+              >
+                {collections.map(c => (
+                  <option key={c} value={c}>{c}</option>
+                ))}
+              </select>
+              <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-slate-500">
+                <ChevronRight className="h-3 w-3 rotate-90" />
+              </div>
+            </div>
           </div>
         )}
 
@@ -318,42 +357,43 @@ export default function ChatPage() {
         <div className="p-4 pb-2">
           <button
             onClick={handleCreateChat}
-            className="flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-purple-600/90 to-blue-600/95 py-3 text-sm font-semibold text-white shadow-md shadow-purple-600/10 transition-all hover:opacity-95 active:scale-95"
+            className="premium-glow-button flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-blue-600 via-indigo-600 to-purple-600 py-3 text-sm font-bold text-white shadow-lg shadow-indigo-600/10 transition-all"
           >
             <Plus className="h-4 w-4" />
             <span>New Consultation</span>
           </button>
         </div>
 
-        {/* Knowledge Base Admin Button for Admin */}
-        {isAdminOrManager && (
-          <div className="px-4 pb-4">
-            <button
-              onClick={() => router.push("/admin")}
-              className="flex w-full items-center justify-center gap-2 rounded-xl border border-purple-500/25 bg-purple-500/5 hover:bg-purple-500/10 py-2.5 text-xs font-semibold text-purple-300 transition-all active:scale-95"
-            >
-              <Database className="h-4 w-4 text-purple-400" />
-              <span>Upload Knowledge Source</span>
-            </button>
+        {/* Search bar inside Sidebar */}
+        <div className="px-4 py-2">
+          <div className="relative">
+            <Search className="absolute left-3 top-2.5 h-3.5 w-3.5 text-slate-500" />
+            <input
+              type="text"
+              placeholder="Search conversation..."
+              value={sidebarSearch}
+              onChange={(e) => setSidebarSearch(e.target.value)}
+              className="w-full rounded-lg bg-slate-950 border border-slate-800 py-2 pl-9 pr-3 text-xs text-white placeholder-slate-550 focus:border-indigo-500 focus:outline-none"
+            />
           </div>
-        )}
+        </div>
 
         {/* Chat History List */}
-        <div className="flex-1 overflow-y-auto px-3 space-y-1">
-          {conversations.map((c) => {
+        <div className="flex-1 overflow-y-auto px-3 py-1 space-y-1">
+          {filteredConversations.map((c) => {
             const isActive = activeConv?.id === c.id;
             return (
               <div
                 key={c.id}
                 onClick={() => loadConversationDetails(c.id)}
-                className={`group flex items-center justify-between rounded-xl px-3.5 py-3 text-sm font-medium cursor-pointer transition-all ${
+                className={`group flex items-center justify-between rounded-xl px-3.5 py-3 text-xs font-semibold cursor-pointer transition-all border ${
                   isActive 
-                    ? "bg-purple-600/15 border border-purple-500/20 text-purple-200" 
-                    : "text-slate-400 hover:bg-slate-900/60 hover:text-white"
+                    ? "bg-indigo-600/15 border-indigo-500/25 text-white" 
+                    : "border-transparent text-slate-400 hover:bg-slate-900/40 hover:text-white"
                 }`}
               >
                 <div className="flex items-center gap-2.5 min-w-0">
-                  <MessageSquare className={`h-4 w-4 shrink-0 ${isActive ? "text-purple-400" : "text-slate-500"}`} />
+                  <MessageSquare className={`h-4 w-4 shrink-0 ${isActive ? "text-indigo-400" : "text-slate-500"}`} />
                   <span className="truncate">{c.title}</span>
                 </div>
                 <button
@@ -369,10 +409,10 @@ export default function ChatPage() {
         </div>
 
         {/* Logout bottom */}
-        <div className="border-t border-slate-800/60 p-4">
+        <div className="border-t border-slate-900 bg-slate-950/20 p-4">
           <button
             onClick={handleLogout}
-            className="flex w-full items-center gap-3 rounded-xl px-3.5 py-3 text-sm font-semibold text-slate-400 hover:bg-red-500/10 hover:text-red-400 transition-all"
+            className="flex w-full items-center gap-3 rounded-xl px-3.5 py-3 text-xs font-bold text-slate-400 hover:bg-red-500/10 hover:text-red-400 transition-all"
           >
             <LogOut className="h-4.5 w-4.5" />
             <span>Sign Out Session</span>
@@ -382,24 +422,31 @@ export default function ChatPage() {
 
       {/* Main Workspace Panel */}
       <div className="flex flex-1 flex-col h-full overflow-hidden bg-[#05070e] relative">
-        {/* Workspace background glows */}
-        <div className="absolute top-[10%] right-[10%] h-[350px] w-[350px] rounded-full bg-purple-600/5 blur-[100px] pointer-events-none" />
-        <div className="absolute bottom-[10%] left-[10%] h-[400px] w-[400px] rounded-full bg-blue-600/5 blur-[110px] pointer-events-none" />
+        {/* Animated drifting gradient backgrounds */}
+        <div className="absolute inset-0 overflow-hidden pointer-events-none z-0">
+          <div className="absolute top-[10%] right-[10%] h-[400px] w-[400px] rounded-full bg-purple-600/5 blur-[120px] animate-drift-one" />
+          <div className="absolute bottom-[10%] left-[10%] h-[450px] w-[450px] rounded-full bg-blue-600/5 blur-[120px] animate-drift-two" />
+        </div>
 
         {/* Chat Title bar */}
-        <div className="flex h-16 items-center justify-between border-b border-slate-800/60 bg-slate-950/20 px-6 backdrop-blur-md z-10">
+        <div className="flex h-16 items-center justify-between border-b border-slate-900 bg-slate-950/20 px-6 backdrop-blur-md z-10">
           <div className="flex items-center gap-2">
             <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
-            <h1 className="text-sm font-bold text-white tracking-wide">
+            <h1 className="text-xs font-extrabold text-white tracking-wider uppercase">
               {activeConv ? activeConv.title : "SAP RAG Assistant"}
             </h1>
+            {selectedCollection !== "Default" && (
+              <span className="ml-2 px-2 py-0.5 text-[9px] font-bold bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 rounded-full">
+                {selectedCollection}
+              </span>
+            )}
           </div>
           {activeConv && activeConv.messages && activeConv.messages.length > 0 && (
             <div className="flex items-center gap-2">
               <button
                 onClick={exportChatMarkdown}
                 title="Export session to Markdown"
-                className="flex h-9 w-9 items-center justify-center rounded-lg border border-slate-800 bg-slate-900/50 text-slate-400 hover:text-purple-400 transition-all"
+                className="flex h-9 w-9 items-center justify-center rounded-lg border border-slate-800 bg-slate-900/40 text-slate-400 hover:text-indigo-400 transition-all"
               >
                 <Download className="h-4 w-4" />
               </button>
@@ -408,30 +455,36 @@ export default function ChatPage() {
         </div>
 
         {/* Messaging Container */}
-        <div className="flex-1 overflow-y-auto px-6 py-8 space-y-6 z-10">
+        <div 
+          ref={scrollContainerRef}
+          onScroll={handleScroll}
+          className="flex-1 overflow-y-auto px-6 py-8 space-y-6 z-10"
+        >
           {!activeConv || activeConv.messages?.length === 0 ? (
-            /* Welcome / Suggesions Workspace */
-            <div className="flex flex-col items-center justify-center h-full text-center max-w-2xl mx-auto space-y-8">
-              <div className="space-y-3">
-                <div className="inline-flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-tr from-purple-600/25 to-blue-500/20 border border-purple-500/20 shadow-md">
-                  <Bot className="h-7 w-7 text-purple-400" />
+            /* Welcome / Suggestions Workspace (Empty State) */
+            <div className="flex flex-col items-center justify-center h-full text-center max-w-2xl mx-auto space-y-8 animate-fade-in">
+              <div className="space-y-3.5">
+                {/* Logo wrapper */}
+                <div className="inline-flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-tr from-blue-600/20 to-indigo-500/20 border border-indigo-500/20 shadow-lg shadow-indigo-500/5">
+                  <Bot className="h-8 w-8 text-indigo-400 animate-pulse" />
                 </div>
-                <h2 className="text-2xl font-bold text-white">SAP Knowledge Copilot</h2>
-                <p className="text-sm text-slate-400 leading-relaxed max-w-md">
-                  This AI platform searches internal functional specifications, configuration guides, and code standards to provide certified answers with source citations.
+                <h2 className="text-2xl font-black tracking-tight text-white">SAP Knowledge Copilot</h2>
+                <p className="text-xs text-slate-400 leading-relaxed max-w-md mx-auto">
+                  Ask technical, functional, or system configurations questions. The engine uses semantic retrieval to formulate precise, citation-backed answers.
                 </p>
               </div>
 
-              <div className="w-full space-y-3">
-                <p className="text-xs font-bold text-slate-500 uppercase tracking-widest text-left">Suggested SAP Inquiries</p>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div className="w-full space-y-4">
+                <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest text-left">Suggested SAP Inquiries</p>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
                   {suggestions.map((s, idx) => (
                     <button
                       key={idx}
-                      onClick={() => handleSend(undefined, s)}
-                      className="text-left text-xs font-medium border border-slate-800/80 bg-slate-900/35 hover:bg-slate-900 hover:border-purple-500/40 p-4 rounded-xl text-slate-300 transition-all active:scale-98"
+                      onClick={() => handleSend(undefined, s.text)}
+                      className="group text-left border border-slate-800 bg-slate-950/40 hover:bg-slate-900/50 hover:border-indigo-500/35 p-4 rounded-xl text-slate-300 transition-all hover:-translate-y-0.5"
                     >
-                      {s}
+                      <p className="text-xs font-bold text-white group-hover:text-indigo-400 transition-colors">{s.text}</p>
+                      <p className="text-[10px] text-slate-500 mt-1 font-semibold">{s.desc}</p>
                     </button>
                   ))}
                 </div>
@@ -439,33 +492,34 @@ export default function ChatPage() {
             </div>
           ) : (
             /* Message list */
-            <div className="max-w-4xl mx-auto space-y-6">
+            <div className="max-w-3xl mx-auto space-y-6">
               {activeConv.messages?.map((m, idx) => {
                 const isAssistant = m.role === "assistant";
                 return (
-                  <div key={idx} className="flex gap-4">
-                    {/* Icon */}
-                    <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border ${
-                      isAssistant 
-                        ? "bg-purple-600/10 border-purple-500/20 text-purple-400" 
-                        : "bg-slate-900 border-slate-800 text-slate-400"
-                    }`}>
-                      {isAssistant ? <Bot className="h-5 w-5" /> : <UserIcon className="h-5 w-5" />}
-                    </div>
+                  <div 
+                    key={idx} 
+                    className={`flex gap-4 ${isAssistant ? "justify-start" : "justify-end"}`}
+                  >
+                    {/* Bot Avatar Icon */}
+                    {isAssistant && (
+                      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border bg-gradient-to-tr from-blue-900/20 to-indigo-900/20 border-indigo-500/30 text-indigo-400 shadow-md">
+                        <Bot className="h-5 w-5" />
+                      </div>
+                    )}
 
                     {/* Message Bubble wrapper */}
-                    <div className="flex-1 space-y-2 max-w-[85%]">
-                      <div className="flex items-center justify-between">
-                        <span className="text-xs font-bold uppercase tracking-wider text-slate-500">
-                          {isAssistant ? "SAP Assistant" : "You"}
+                    <div className={`flex-1 space-y-1.5 max-w-[85%] ${!isAssistant && "text-right"}`}>
+                      <div className="flex items-center justify-between px-1">
+                        <span className="text-[9px] font-bold uppercase tracking-widest text-slate-500">
+                          {isAssistant ? "SAP AI Agent" : "Consultant"}
                         </span>
                         
                         {/* Copy Code action */}
                         {isAssistant && m.content && (
-                          <div className="flex items-center gap-1.5 opacity-60 hover:opacity-100 transition-opacity">
+                          <div className="flex items-center gap-1.5 opacity-50 hover:opacity-100 transition-all">
                             <button
                               onClick={() => copyToClipboard(m.content, m.id)}
-                              className="text-slate-500 hover:text-purple-400 p-1"
+                              className="text-slate-400 hover:text-indigo-400 p-0.5"
                               title="Copy markdown text"
                             >
                               {copiedId === m.id ? <Check className="h-3.5 w-3.5 text-emerald-400" /> : <Copy className="h-3.5 w-3.5" />}
@@ -474,13 +528,17 @@ export default function ChatPage() {
                         )}
                       </div>
 
-                      {/* Content text */}
-                      <div className="text-sm leading-relaxed text-slate-200 bg-slate-900/15 border border-slate-800/10 p-3 rounded-2xl">
+                      {/* Content text - distinct styling for user/bot */}
+                      <div className={`text-sm leading-relaxed p-4 rounded-2xl border ${
+                        isAssistant 
+                          ? "bg-slate-900/30 border-slate-800 text-slate-200" 
+                          : "bg-gradient-to-r from-blue-700/25 to-indigo-700/20 border-indigo-500/20 text-white rounded-tr-none ml-auto max-w-fit text-left shadow-lg shadow-indigo-650/5"
+                      }`}>
                         {loading && isAssistant && !m.content ? (
-                          <div className="flex items-center gap-1.5 py-1">
-                            <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-purple-500" />
-                            <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-purple-500 [animation-delay:0.2s]" />
-                            <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-purple-500 [animation-delay:0.4s]" />
+                          <div className="flex items-center gap-1.5 py-1.5">
+                            <span className="h-2 w-2 animate-bounce rounded-full bg-indigo-500" />
+                            <span className="h-2 w-2 animate-bounce rounded-full bg-indigo-500 [animation-delay:0.2s]" />
+                            <span className="h-2 w-2 animate-bounce rounded-full bg-indigo-500 [animation-delay:0.4s]" />
                           </div>
                         ) : (
                           <ReactMarkdown rehypePlugins={[rehypeHighlight]}>
@@ -489,19 +547,24 @@ export default function ChatPage() {
                         )}
                       </div>
 
+                      {/* Timestamp/Sub-text */}
+                      <div className="px-1 flex justify-between items-center text-[9px] text-slate-600 font-semibold mt-1">
+                        <span>{m.created_at ? new Date(m.created_at).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) : ""}</span>
+                      </div>
+
                       {/* Source Citation Badges */}
                       {isAssistant && m.citations && m.citations.length > 0 && (
                         <div className="space-y-1.5 pt-2">
-                          <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Document Citations</p>
+                          <p className="text-[9px] font-bold text-slate-500 uppercase tracking-widest">Document Citations</p>
                           <div className="flex flex-wrap gap-2">
                             {m.citations.map((c, cIdx) => (
                               <button
                                 key={cIdx}
                                 onClick={() => setSelectedCitation(c)}
-                                className="flex items-center gap-1.5 rounded-lg border border-slate-800 bg-slate-900/60 px-2.5 py-1 text-xs font-semibold text-purple-300 hover:border-purple-500/40 hover:bg-slate-950 transition-all"
+                                className="inline-flex items-center gap-1.5 rounded-lg border border-slate-800 bg-slate-900/50 hover:bg-indigo-600/10 hover:border-indigo-500/30 px-3 py-1.5 text-xs text-slate-400 hover:text-indigo-300 font-medium transition-all"
                               >
-                                <FileText className="h-3.5 w-3.5 shrink-0 text-purple-400" />
-                                <span>[{cIdx + 1}] {c.doc_name} {c.page ? `(Page ${c.page})` : ""}</span>
+                                <FileText className="h-3 w-3 text-indigo-400" />
+                                <span>{c.doc_name.slice(0, 20)}... (P. {c.page || "1"})</span>
                               </button>
                             ))}
                           </div>
@@ -509,14 +572,14 @@ export default function ChatPage() {
                       )}
 
                       {/* Feedback buttons */}
-                      {isAssistant && m.content && !loading && (
-                        <div className="flex items-center gap-3 pt-2">
+                      {isAssistant && m.content && (
+                        <div className="flex justify-start gap-2 pt-2 border-t border-slate-900/60 mt-2">
                           <button
                             onClick={() => {
                               setFeedbackMsgId(m.id);
                               setFeedbackScore(1);
                             }}
-                            className="text-slate-500 hover:text-emerald-400 transition-all p-1"
+                            className="rounded-lg hover:bg-slate-900 hover:text-emerald-400 text-slate-500 p-1.5 transition-all"
                             title="Helpful response"
                           >
                             <ThumbsUp className="h-3.5 w-3.5" />
@@ -526,7 +589,7 @@ export default function ChatPage() {
                               setFeedbackMsgId(m.id);
                               setFeedbackScore(-1);
                             }}
-                            className="text-slate-500 hover:text-red-400 transition-all p-1"
+                            className="rounded-lg hover:bg-slate-900 hover:text-red-400 text-slate-500 p-1.5 transition-all"
                             title="Unhelpful / hallucinated response"
                           >
                             <ThumbsDown className="h-3.5 w-3.5" />
@@ -542,28 +605,38 @@ export default function ChatPage() {
           )}
         </div>
 
+        {/* Scroll-to-bottom Floating Action Button */}
+        {showScrollBottom && (
+          <button
+            onClick={scrollToBottom}
+            className="absolute bottom-24 right-8 z-30 flex h-10 w-10 items-center justify-center rounded-full bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg transition-all animate-bounce"
+          >
+            <ArrowDown className="h-5 w-5" />
+          </button>
+        )}
+
         {/* Input Bar Panel */}
-        <div className="border-t border-slate-800/60 bg-slate-950/20 px-6 py-4 z-10 backdrop-blur-md">
-          <div className="max-w-4xl mx-auto">
+        <div className="border-t border-slate-900 bg-slate-950/20 px-6 py-4.5 z-10 backdrop-blur-md">
+          <div className="max-w-3xl mx-auto">
             <form onSubmit={handleSend} className="relative flex items-center">
               <input
                 type="text"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder="Ask a technical or functional SAP question..."
-                className="w-full rounded-2xl bg-slate-900/75 border border-slate-800/80 py-4 pl-5 pr-14 text-sm text-white placeholder-slate-500 transition-all focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500"
+                className="w-full rounded-2xl bg-slate-900/60 border border-slate-800/80 py-4 pl-5 pr-14 text-sm text-white placeholder-slate-500 transition-all focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
               />
               <button
                 type="submit"
                 disabled={loading || !query.trim()}
-                className="absolute right-3.5 flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-tr from-purple-600 to-indigo-500 text-white shadow-md shadow-purple-600/10 hover:opacity-95 active:scale-95 disabled:opacity-30 disabled:scale-100 transition-all"
+                className="absolute right-3.5 flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-tr from-blue-600 via-indigo-600 to-purple-600 text-white shadow-md shadow-indigo-600/10 hover:opacity-95 active:scale-95 disabled:opacity-30 disabled:scale-100 transition-all"
               >
                 <Send className="h-4.5 w-4.5" />
               </button>
             </form>
-            <div className="mt-2 text-center">
-              <span className="text-[10px] text-slate-500 tracking-wider">
-                Platform conforms to Grounded boundaries. Responses are generated solely from loaded files.
+            <div className="mt-2.5 text-center">
+              <span className="text-[10px] font-semibold text-slate-600 tracking-wider">
+                This platform is strictly grounded. Responses are formulated solely from loaded knowledge sources.
               </span>
             </div>
           </div>
@@ -575,7 +648,7 @@ export default function ChatPage() {
             <div className="w-full max-w-md h-full bg-slate-900 border-l border-slate-800 p-6 flex flex-col shadow-2xl relative animate-slide-in">
               <div className="flex items-center justify-between border-b border-slate-800 pb-4 mb-4">
                 <div className="flex items-center gap-2">
-                  <FileText className="h-5 w-5 text-purple-400" />
+                  <FileText className="h-5 w-5 text-indigo-400" />
                   <h3 className="font-bold text-white">Source Verification</h3>
                 </div>
                 <button 
@@ -588,24 +661,24 @@ export default function ChatPage() {
 
               <div className="flex-1 overflow-y-auto space-y-4 pr-1 text-sm text-slate-300">
                 <div className="rounded-xl bg-slate-950 p-4 border border-slate-800 space-y-2">
-                  <p className="text-xs font-bold text-slate-500 uppercase tracking-wider">Document Name</p>
+                  <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Document Name</p>
                   <p className="font-semibold text-white">{selectedCitation.doc_name}</p>
                 </div>
 
                 <div className="grid grid-cols-2 gap-3">
                   <div className="rounded-xl bg-slate-950 p-4 border border-slate-800 space-y-1">
-                    <p className="text-xs font-bold text-slate-500 uppercase tracking-wider">Page Offset</p>
+                    <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Page Offset</p>
                     <p className="font-semibold text-white">{selectedCitation.page || "N/A"}</p>
                   </div>
                   <div className="rounded-xl bg-slate-950 p-4 border border-slate-800 space-y-1">
-                    <p className="text-xs font-bold text-slate-500 uppercase tracking-wider">Section Chapter</p>
+                    <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Section Chapter</p>
                     <p className="font-semibold text-white">{selectedCitation.section || "N/A"}</p>
                   </div>
                 </div>
 
                 <div className="rounded-xl bg-slate-950/40 border border-slate-800/80 p-4 space-y-2.5">
                   <div className="flex items-center gap-2 text-xs font-bold text-slate-500 uppercase tracking-wider">
-                    <Terminal className="h-4.5 w-4.5 text-purple-400" />
+                    <Terminal className="h-4.5 w-4.5 text-indigo-400" />
                     <span>CITED SEGMENT TEXT</span>
                   </div>
                   {selectedCitation.text ? (
@@ -649,7 +722,7 @@ export default function ChatPage() {
                   onChange={(e) => setFeedbackComment(e.target.value)}
                   placeholder="Enter your observations..."
                   rows={4}
-                  className="w-full rounded-xl bg-slate-950 border border-slate-800 p-3 text-sm text-white placeholder-slate-500 focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500"
+                  className="w-full rounded-xl bg-slate-950 border border-slate-800 p-3 text-sm text-white placeholder-slate-550 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
                 />
               </div>
 
@@ -662,7 +735,7 @@ export default function ChatPage() {
                 </button>
                 <button
                   onClick={submitFeedback}
-                  className="rounded-xl bg-purple-600 px-4 py-2.5 text-xs font-semibold text-white shadow-md hover:bg-purple-500 transition-all"
+                  className="rounded-xl bg-indigo-600 px-4 py-2.5 text-xs font-semibold text-white shadow-md hover:bg-indigo-550 transition-all"
                 >
                   Submit Review
                 </button>
