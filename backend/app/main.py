@@ -87,10 +87,12 @@ except Exception as e:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Warm the local embedding model at process startup instead of paying
-    # its multi-second load cost inline on the first user's chat request
-    # (see backend/PERFORMANCE_AUDIT.md). run_in_threadpool so this doesn't
-    # block anything else during startup any more than necessary.
-    await run_in_threadpool(EmbeddingsService.warm_up)
+    # its multi-second load cost inline on the first user's chat request.
+    # On Render, we skip startup warming to prevent port binding timeouts.
+    if not os.environ.get("RENDER"):
+        await run_in_threadpool(EmbeddingsService.warm_up)
+    else:
+        logger.info("Render environment detected: skipping startup embedding model warm-up to prevent port binding timeout.")
     gc.collect()  # Force garbage collection to release loading overhead RAM
     yield
 
