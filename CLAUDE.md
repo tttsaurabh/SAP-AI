@@ -931,3 +931,108 @@ underlying simulated behavior (hardcoded `SIMULATED_NOTES`, any-credentials
 auth, regex/string-matching ABAP "validation", static transition/
 integration prose) is unchanged and still tracked as a separate, larger
 integration project if real SAP connectivity is ever pursued.
+
+### 2026-07-12 — Phase 7a: Frontend low-risk fixes
+
+Non-security "frontend structural cleanup" pass, the lower-risk half of
+Phase 7 (component extraction and test-writing are Phase 7b, done
+separately). Verified with `npx tsc --noEmit` (zero errors, both mid-pass
+and at the end) and `npm run lint` (baseline unchanged before/after, see
+item 3). No backend changes were made or verified in this phase.
+
+**1. Configurable `API_URL`** (`frontend/lib/api.ts`,
+`frontend/.env.local.example`): `API_URL` hardcoded
+`http://localhost:8000/api` with zero `process.env` usage anywhere in the
+frontend, so the app couldn't be pointed at a non-local backend without a
+code change + rebuild. Now reads `process.env.NEXT_PUBLIC_API_URL`,
+falling back to the same localhost default. Added
+`frontend/.env.local.example` documenting the var. Confirmed root
+`.gitignore` already excludes `.env.local`/`.env.*.local` (no
+`frontend/.gitignore` exists separately), so the example file is tracked
+normally.
+
+**2. Removed unused `framer-motion` dependency**
+(`frontend/package.json`, `frontend/package-lock.json`): grepped
+`frontend/app` and `frontend/lib` (including after the recent UI-redesign
+commit) — zero imports/usage found, only referenced in
+`package.json`/lockfile. Removed and ran `npm install` (3 packages
+removed from the lockfile).
+
+**3. Committed ESLint config** (`frontend/package.json`,
+`frontend/.eslintrc.json`): `package.json` had a `lint: next lint` script
+but `eslint` wasn't a listed dependency and there was no committed
+`.eslintrc*`, so `npm run lint` failed outright on a clean checkout. Added
+`eslint@^8.57.1` and `eslint-config-next@^15.5.20` (matching the installed
+Next.js 15.5.20) as devDependencies, and `.eslintrc.json` extending
+`next/core-web-vitals`. **Lint baseline** established and left as-is (not
+mass-fixed, out of scope for this pass): 2 errors
+(`react/no-unescaped-entities` — unescaped `"` characters around line 691
+in `app/chat/page.tsx`, since shifted to ~701 after item 5's edits) and 3
+warnings (two `react-hooks/exhaustive-deps` missing-dependency warnings in
+`app/chat/page.tsx` and `app/workbench/page.tsx`, one
+`@next/next/no-page-custom-font` warning in `app/layout.tsx`).
+
+**4. Reduced `any` typing in the API client** (`frontend/lib/api.ts`):
+replaced `Promise<any>` return types on `analyzeDump`, `searchNotes`,
+`authenticateNotes`, `validateCode`, `getTransitionGuide`,
+`getIntegrationSpec`, `getDocumentAnalytics`, `getConversationAnalytics`
+with real interfaces read from the backend's actual response-building
+code (not invented): `DocumentAnalytics`/`ConversationAnalytics` match
+`backend/app/schemas/schemas.py`'s Pydantic `response_model`s exactly;
+the six SAP Agentic Workbench response shapes
+(`DumpAnalysisResult`, `NoteSearchResult`, `AuthenticateNotesResult`,
+`ValidateCodeResult`, `TransitionGuideResult`, `IntegrationSpecResult`,
+plus nested `SapNoteDetails`/`AbapCodeViolation`/step types) were
+hand-derived from the dicts built in
+`backend/app/services/sap_agentic_service.py` and
+`backend/app/api/sap_agentic.py` — none of those six endpoints declare a
+Pydantic `response_model`, and each now includes the Phase 6
+`simulated: true` field, reflected as a literal-`true` type. `login`,
+`register`, and `submitFeedback` were left as `Promise<any>` (not in this
+item's listed scope); `workbench`/`admin` page-level `useState<any>`
+result state was left untouched since `any` still accepts the newly typed
+return values — only the `api.ts` function signatures changed.
+
+**5. ARIA labels on icon-only buttons**
+(`frontend/app/chat/page.tsx`, `frontend/app/admin/page.tsx`,
+`frontend/app/workbench/page.tsx`, `frontend/app/auth/page.tsx`): grepped
+all `<button>` elements across `frontend/app/*/page.tsx` for ones whose
+only content is a bare `lucide-react` icon (no visible text child) and
+added a specific `aria-label` to each — Workbench/Admin nav icons,
+per-conversation delete, export-to-Markdown, copy message, thumbs up/down
+feedback, scroll-to-bottom, send message, close citation drawer, close
+feedback dialog (`chat/page.tsx`); back-to-chat, inspect chunks (label
+includes filename), delete document (label includes filename), close
+chunk inspector (`admin/page.tsx`); return-to-chat
+(`workbench/page.tsx`); show/hide password toggle, label flips with
+state (`auth/page.tsx`). Buttons that already render visible text (tab
+selectors, "New Consultation", citation badges showing doc name + page,
+Cancel/Submit, etc.) were left untouched.
+
+**Unrelated finding, not acted on**: throughout this phase, `git status`
+repeatedly showed uncommitted changes appearing in `backend/app/core
+/config.py`, `backend/app/services/vector_db.py`,
+`backend/requirements.txt`, plus untracked
+`backend/app/services/supabase_db.py` and `backend/supabase_setup.sql` —
+none of which this phase (or any prior phase's task) touched or authored.
+Consistent with the Phase 5 precedent for an unexplained uncommitted
+diff: left alone, not folded into any of this phase's commits, and not
+investigated further. If you're reading this in a future session and
+don't recognize these changes either, ask the user before committing,
+discarding, or building on them.
+
+**Follow-ups for later phases**:
+- Lint baseline (2 errors, 3 warnings, see item 3) is not fixed — a
+  future pass could address the two `react/no-unescaped-entities` errors
+  in `app/chat/page.tsx` (trivial) and the two
+  `react-hooks/exhaustive-deps` warnings, but neither blocks `npm run
+  build` and both were left as pre-existing/out-of-scope for this pass.
+  `next lint` itself also prints a deprecation notice (removed in Next.js
+  16) unrelated to this repo — worth migrating to the ESLint CLI directly
+  (`npx @next/codemod@canary next-lint-to-eslint-cli .`) in a future
+  phase.
+- `login`, `register`, `submitFeedback` in `frontend/lib/api.ts` still
+  return `Promise<any>` — out of this item's listed scope, not fixed
+  here.
+- Phase 7b (component extraction, test-writing) is a separate,
+  not-yet-started phase.
