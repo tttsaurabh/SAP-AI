@@ -51,67 +51,137 @@ class EmbeddingsService:
                 return 3072
             return 1536
         elif model_setting.startswith("gemini:"):
-            return 768
+            # gemini-embedding-001 is Matryoshka: we request output_dimensionality
+            # equal to EMBEDDING_DIMENSION at call time, so that is the truth here
+            # (default 768). Kept <=2000 so a pgvector HNSW index can be built.
+            return settings.EMBEDDING_DIMENSION
         # default local all-MiniLM-L6-v2 is 384
         return 384
+
+    @staticmethod
+    def _l2_normalize(vec: List[float]) -> List[float]:
+        """Unit-normalize a vector. gemini-embedding-001 returns pre-normalized
+        vectors only at its native 3072 dims; Google recommends re-normalizing
+        any truncated (Matryoshka) output before use."""
+        arr = np.asarray(vec, dtype=np.float64)
+        norm = np.linalg.norm(arr)
+        if norm == 0:
+            return arr.tolist()
+        return (arr / norm).tolist()
 
     @classmethod
     def get_embeddings(cls, texts: Union[str, List[str]]) -> List[List[float]]:
         if isinstance(texts, str):
             texts = [texts]
-            
+
         model_setting = settings.EMBEDDING_MODEL
         logger.info(f"Generating embeddings for {len(texts)} texts using model {model_setting}")
 
+        # When EMBEDDING_MODEL explicitly pins a provider (e.g. "gemini:..."),
+        # a failure in that provider must RAISE -- silently falling through to
+        # a different provider produces vectors of a *different dimension* than
+        # the stored pgvector index, which the DB then rejects and
+        # supabase_db.search_similarity swallows into an empty result. That
+        # exact failure mode (Gemini query vectors at 768 vs a 384-dim index)
+        # turned a config change into a silent, total retrieval outage. Only an
+        # unpinned model (no "<provider>:" prefix) may cascade Gemini -> local
+        # -> deterministic hash for dev/no-keys convenience.
+        explicit_provider = None
+        for prefix in ("gemini", "openai", "local"):
+            if model_setting.startswith(f"{prefix}:"):
+                explicit_provider = prefix
+                break
+
         # 1. Google Gemini Embeddings
-        if model_setting.startswith("gemini:") or (settings.GEMINI_API_KEY and not model_setting.startswith("openai:") and not model_setting.startswith("local:")):
-            if genai:
-                try:
-                    api_key = settings.GEMINI_API_KEY
-                    if api_key:
-                        genai.configure(api_key=api_key)
-                        # Gemini default embedding model
-                        model = "models/text-embedding-004"
-                        result = genai.embed_content(
-                            model=model,
-                            content=texts,
-                            task_type="retrieval_document"
-                        )
-                        return result['embedding']
-                except Exception as e:
-                    logger.error(f"Gemini embedding generation failed: {str(e)}")
-            else:
-                logger.warning("google-generativeai package not available.")
+        if explicit_provider == "gemini" or (
+            explicit_provider is None
+            and settings.GEMINI_API_KEY
+        ):
+            try:
+                if not genai:
+                    raise RuntimeError("google-generativeai package not available.")
+                api_key = settings.GEMINI_API_KEY
+                if not api_key:
+                    raise RuntimeError("GEMINI_API_KEY is not set.")
+                genai.configure(api_key=api_key)
+                # Model name comes from the "gemini:<model>" setting (falls back
+                # to the current GA embedding model). NOTE: the older
+                # "text-embedding-004" is NOT served for embedContent on current
+                # API keys (404) -- "gemini-embedding-001" is the GA model.
+                model = model_setting.split(":", 1)[1] if ":" in model_setting else "gemini-embedding-001"
+                if not model.startswith("models/"):
+                    model = f"models/{model}"
+                # gemini-embedding-001 is 3072-dim natively; request the configured
+                # dimension so it matches the stored pgvector column and stays
+                # <=2000 for indexability.
+                out_dim = settings.EMBEDDING_DIMENSION
+                result = genai.embed_content(
+                    model=model,
+                    content=texts,
+                    task_type="retrieval_document",
+                    output_dimensionality=out_dim,
+                )
+                embeddings = result["embedding"]  # list-of-lists (input is a list)
+                if out_dim != 3072:
+                    embeddings = [cls._l2_normalize(e) for e in embeddings]
+                return embeddings
+            except Exception as e:
+                logger.error(f"Gemini embedding generation failed: {str(e)}")
+                if explicit_provider == "gemini":
+                    raise RuntimeError(
+                        "EMBEDDING_MODEL is pinned to Gemini; refusing to fall "
+                        f"back to a different-dimension provider: {e}"
+                    ) from e
 
         # 2. OpenAI Embeddings
-        if model_setting.startswith("openai:") and settings.OPENAI_API_KEY:
-            if OpenAI:
-                try:
-                    client = OpenAI(api_key=settings.OPENAI_API_KEY)
-                    engine = model_setting.split(":", 1)[1] if ":" in model_setting else "text-embedding-3-small"
-                    response = client.embeddings.create(input=texts, model=engine)
-                    return [data.embedding for data in response.data]
-                except Exception as e:
-                    logger.error(f"OpenAI embedding generation failed: {str(e)}")
-            else:
-                logger.warning("openai package not available.")
+        if explicit_provider == "openai":
+            try:
+                if not OpenAI:
+                    raise RuntimeError("openai package not available.")
+                if not settings.OPENAI_API_KEY:
+                    raise RuntimeError("OPENAI_API_KEY is not set.")
+                client = OpenAI(api_key=settings.OPENAI_API_KEY)
+                engine = model_setting.split(":", 1)[1] if ":" in model_setting else "text-embedding-3-small"
+                response = client.embeddings.create(input=texts, model=engine)
+                return [data.embedding for data in response.data]
+            except Exception as e:
+                logger.error(f"OpenAI embedding generation failed: {str(e)}")
+                raise RuntimeError(
+                    "EMBEDDING_MODEL is pinned to OpenAI; refusing to fall "
+                    f"back to a different-dimension provider: {e}"
+                ) from e
 
-        # 3. Local SentenceTransformers Embeddings
-        if model_setting.startswith("local:") or SentenceTransformer is not None:
-            if SentenceTransformer:
-                try:
-                    if cls._local_model is None:
-                        model_name = model_setting.split(":", 1)[1] if ":" in model_setting else "all-MiniLM-L6-v2"
-                        logger.info(f"Loading local SentenceTransformer model: {model_name}")
-                        cls._local_model = SentenceTransformer(model_name)
-                    embeddings = cls._local_model.encode(texts)
-                    return embeddings.tolist()
-                except Exception as e:
-                    logger.error(f"Local SentenceTransformer embedding generation failed: {str(e)}")
-            else:
-                logger.warning("sentence-transformers package not available for local embeddings.")
+        # 3. Local SentenceTransformers Embeddings.
+        # Skipped when the model is pinned to a remote provider above, so a
+        # transient Gemini/OpenAI failure never silently yields 384-dim local
+        # vectors against a 768/1536-dim index.
+        if explicit_provider == "local" or explicit_provider is None:
+            try:
+                if not SentenceTransformer:
+                    raise RuntimeError("sentence-transformers package not available for local embeddings.")
+                if cls._local_model is None:
+                    model_name = model_setting.split(":", 1)[1] if ":" in model_setting else "all-MiniLM-L6-v2"
+                    logger.info(f"Loading local SentenceTransformer model: {model_name}")
+                    cls._local_model = SentenceTransformer(model_name)
+                embeddings = cls._local_model.encode(texts)
+                return embeddings.tolist()
+            except Exception as e:
+                logger.error(f"Local SentenceTransformer embedding generation failed: {str(e)}")
+                if explicit_provider == "local":
+                    raise RuntimeError(
+                        "EMBEDDING_MODEL is pinned to local sentence-transformers "
+                        f"but it is unavailable: {e}"
+                    ) from e
 
-        # 4. Deterministic Hash Fallback (ensures development/testing runs smoothly without keys or local models)
+        # 4. Deterministic Hash Fallback (development/testing without keys or
+        # local models only). Never used for an explicitly pinned provider --
+        # those raise above rather than return wrong-dimension vectors.
+        if explicit_provider is not None:
+            raise RuntimeError(
+                f"EMBEDDING_MODEL is pinned to '{model_setting}' but that provider "
+                "is unavailable; refusing deterministic-hash fallback so a "
+                "misconfiguration surfaces loudly instead of poisoning retrieval."
+            )
         logger.warning("Using mock deterministic hash embeddings fallback.")
         dim = cls.get_embedding_dimension()
         fallback_embeddings = []

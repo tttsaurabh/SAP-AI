@@ -216,7 +216,10 @@ async def stream_chat_response(
         def producer():
             try:
                 for delta in RAGEngine.stream_response(db, collection, query, history, chunks_out=chunks_out):
-                    loop.call_soon_threadsafe(queue.put_nowait, ("content", delta))
+                    if isinstance(delta, dict) and delta.get("type") == "status":
+                        loop.call_soon_threadsafe(queue.put_nowait, ("status", delta.get("message", "")))
+                    else:
+                        loop.call_soon_threadsafe(queue.put_nowait, ("content", delta))
             except Exception as e:
                 logger.exception(f"Streaming generation failed for conversation {conv_id}")
                 loop.call_soon_threadsafe(queue.put_nowait, ("error", str(e)))
@@ -260,6 +263,9 @@ async def stream_chat_response(
             elif kind == "error":
                 logger.error(f"Chat stream error for conversation {conv_id}: {payload}")
                 break
+            elif kind == "status":
+                data = {"type": "status", "message": payload}
+                yield f"data: {json.dumps(data)}\n\n"
             elif kind is DONE:
                 break
 
@@ -273,6 +279,12 @@ async def stream_chat_response(
             return
 
         response_text = "".join(full_text_parts) or "An error occurred while generating the response."
+        if not history:
+            RAGEngine.set_cached_response(
+                RAGEngine.response_cache_key(collection, query),
+                response_text,
+                chunks_out,
+            )
         citations = RAGEngine.build_citations(response_text, chunks_out)
 
         assistant_msg = await run_in_threadpool(_save_assistant_message, db, conv_id, response_text, citations)

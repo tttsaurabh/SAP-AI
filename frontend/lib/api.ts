@@ -410,7 +410,8 @@ export const api = {
     onContent: (chunk: string) => void,
     onCitations: (data: { message_id: number; citations: Citation[] }) => void,
     onError: (err: string) => void,
-    onDone: () => void
+    onDone: () => void,
+    onStatus?: (message: string) => void
   ) => {
     const token = getAuthToken();
     const url = `${API_URL}/chat/conversations/${convId}/stream?query=${encodeURIComponent(query)}&collection=${encodeURIComponent(collection)}`;
@@ -446,6 +447,8 @@ export const api = {
               const data = JSON.parse(dataStr);
               if (data.type === "content") {
                 onContent(data.delta);
+              } else if (data.type === "status") {
+                onStatus?.(data.message);
               } else if (data.type === "citations") {
                 onCitations({ message_id: data.message_id, citations: data.citations });
               } else if (data.type === "done") {

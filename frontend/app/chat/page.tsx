@@ -267,6 +267,19 @@ export default function ChatPage() {
       () => {
         setLoading(false);
         loadConversations(); // refresh title list
+      },
+      // onStatus
+      (message) => {
+        if (currentContent) return;
+        setActiveConv(prev => {
+          if (!prev) return null;
+          return {
+            ...prev,
+            messages: (prev.messages || []).map(m =>
+              m.id === assistantMsgId ? { ...m, content: `_${message}_` } : m
+            )
+          };
+        });
       }
     );
   };

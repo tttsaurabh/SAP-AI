@@ -40,13 +40,20 @@ class Settings(BaseSettings):
     OPENAI_MODEL: str = "gpt-4o-mini"
     ANTHROPIC_MODEL: str = "claude-3-haiku-20240307"
     LLM_TIMEOUT_SECONDS: float = 25.0
-    
+    CHAT_PREWARM_ENABLED: bool = False
+
     # Ingestion Configurations
     UPLOADS_DIR: str = "./uploads"
     OCR_ENABLED: bool = False
-    EMBEDDING_MODEL: str = "local:sentence-transformers/all-MiniLM-L6-v2"
+    EMBEDDING_MODEL: str = "gemini:gemini-embedding-001"
     RERANK_ENABLED: bool = False
     RERANK_MODEL: str = ""
+    RAG_CACHE_ENABLED: bool = True
+    RAG_CACHE_TTL_SECONDS: int = 300
+    RAG_CACHE_MAX_ENTRIES: int = 128
+    RAG_DEFAULT_TOP_K: int = 3
+    RAG_BROAD_TOP_K: int = 5
+    RAG_CONTEXT_CHARS_PER_CHUNK: int = 1800
 
     # ── Parent-child chunking (Phase 8b) ─────────────────────────────────────
     # Small "child" chunks are embedded/indexed for precise retrieval
@@ -71,7 +78,10 @@ class Settings(BaseSettings):
     # Supabase pgvector table name
     SUPABASE_VECTOR_TABLE: str = "document_vectors"
     # Embedding dimension (768 for Gemini text-embedding-004, 384 for all-MiniLM-L6-v2, 1536 for OpenAI text-embedding-ada-002)
-    EMBEDDING_DIMENSION: int = 384
+    # Must match EMBEDDING_MODEL above AND the pgvector column dimension the
+    # documents were ingested with -- a mismatch makes pgvector's <=> operator
+    # throw, which is swallowed to an empty result (see supabase_db.search_similarity).
+    EMBEDDING_DIMENSION: int = 768
 
     # PDF Parser Engine
     PDF_PARSER_ENGINE: str = "pymupdf"  # "pymupdf" or "unlimited_ocr"

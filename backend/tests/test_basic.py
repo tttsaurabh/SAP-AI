@@ -43,12 +43,48 @@ class TestSAPRAGPipeline(unittest.TestCase):
         self.assertIn("ENDCLASS", full_text)  # code block intact
 
         
-    def test_embeddings_fallback(self):
-        # 2. Test that embeddings are generated (either by API or deterministic mock fallback)
-        test_text = "Verify SAP Master Data Governance change requests workflow."
-        vecs = EmbeddingsService.get_embeddings(test_text)
-        self.assertEqual(len(vecs), 1)
-        self.assertEqual(len(vecs[0]), EmbeddingsService.get_embedding_dimension())
+    def test_embeddings_deterministic_fallback(self):
+        # 2. With NO provider pinned and no API keys, embeddings fall back to
+        # the deterministic hash vectors (offline/dev path). This must stay
+        # working and dimension-correct. (Network-free: no real provider call.)
+        from app.core.config import settings
+        from app.services import embeddings as emb_module
+        saved = (
+            settings.EMBEDDING_MODEL,
+            settings.GEMINI_API_KEY,
+            settings.OPENAI_API_KEY,
+            emb_module.SentenceTransformer,
+        )
+        try:
+            settings.EMBEDDING_MODEL = "mock"   # unpinned -> cascade to fallback allowed
+            settings.GEMINI_API_KEY = ""
+            settings.OPENAI_API_KEY = ""
+            emb_module.SentenceTransformer = None  # force past the local leg to the hash fallback
+            vecs = EmbeddingsService.get_embeddings("Verify SAP MDG change requests workflow.")
+            self.assertEqual(len(vecs), 1)
+            self.assertEqual(len(vecs[0]), EmbeddingsService.get_embedding_dimension())
+        finally:
+            (
+                settings.EMBEDDING_MODEL,
+                settings.GEMINI_API_KEY,
+                settings.OPENAI_API_KEY,
+                emb_module.SentenceTransformer,
+            ) = saved
+
+    def test_pinned_provider_raises_instead_of_wrong_dimension_fallback(self):
+        # A pinned remote provider that is unavailable must RAISE, never silently
+        # fall back to a different-dimension vector. Silently returning a 384-dim
+        # local/hash vector against a 768-dim pgvector index is exactly what
+        # caused the deployed "returns nothing" retrieval outage.
+        from app.core.config import settings
+        saved = (settings.EMBEDDING_MODEL, settings.GEMINI_API_KEY)
+        try:
+            settings.EMBEDDING_MODEL = "gemini:text-embedding-004"
+            settings.GEMINI_API_KEY = ""   # provider unavailable
+            with self.assertRaises(RuntimeError):
+                EmbeddingsService.get_embeddings("x")
+        finally:
+            (settings.EMBEDDING_MODEL, settings.GEMINI_API_KEY) = saved
         
     def test_rag_engine_mock_generation(self):
         # 3. Test that RAGEngine returns the exact knowledge boundary string when context is empty

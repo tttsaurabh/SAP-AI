@@ -1,7 +1,10 @@
 import re
 import time
+import copy
+import threading
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from loguru import logger
 from sqlalchemy import func, tuple_
 from sqlalchemy.orm import Session
@@ -28,6 +31,126 @@ except ImportError:
     anthropic = None
 
 class RAGEngine:
+    _retrieval_cache: "OrderedDict[Tuple[str, str, int, str, bool], Tuple[float, List[Dict[str, Any]]]]" = OrderedDict()
+    _response_cache: "OrderedDict[Tuple[str, str, str, str], Tuple[float, str, List[Dict[str, Any]]]]" = OrderedDict()
+    _retrieval_cache_lock = threading.Lock()
+    _response_cache_lock = threading.Lock()
+
+    @staticmethod
+    def _normalize_cache_query(query: str) -> str:
+        return re.sub(r"\s+", " ", (query or "").strip().lower())
+
+    @staticmethod
+    def _cache_key(collection_name: str, query: str, limit: int) -> Tuple[str, str, int, str, bool]:
+        return (
+            collection_name or "Default",
+            RAGEngine._normalize_cache_query(query),
+            limit,
+            settings.EMBEDDING_MODEL,
+            bool(settings.RERANK_ENABLED),
+        )
+
+    @staticmethod
+    def _get_cached_retrieval(cache_key: Tuple[str, str, int, str, bool]) -> Optional[List[Dict[str, Any]]]:
+        if not settings.RAG_CACHE_ENABLED:
+            return None
+
+        now = time.time()
+        ttl = max(1, settings.RAG_CACHE_TTL_SECONDS)
+        with RAGEngine._retrieval_cache_lock:
+            cached = RAGEngine._retrieval_cache.get(cache_key)
+            if not cached:
+                return None
+            created_at, chunks = cached
+            if now - created_at > ttl:
+                RAGEngine._retrieval_cache.pop(cache_key, None)
+                return None
+            RAGEngine._retrieval_cache.move_to_end(cache_key)
+            logger.info("Hybrid search cache hit.")
+            return copy.deepcopy(chunks)
+
+    @staticmethod
+    def _set_cached_retrieval(cache_key: Tuple[str, str, int, str, bool], chunks: List[Dict[str, Any]]) -> None:
+        if not settings.RAG_CACHE_ENABLED or not chunks:
+            return
+
+        max_entries = max(1, settings.RAG_CACHE_MAX_ENTRIES)
+        with RAGEngine._retrieval_cache_lock:
+            RAGEngine._retrieval_cache[cache_key] = (time.time(), copy.deepcopy(chunks))
+            RAGEngine._retrieval_cache.move_to_end(cache_key)
+            while len(RAGEngine._retrieval_cache) > max_entries:
+                RAGEngine._retrieval_cache.popitem(last=False)
+
+    @staticmethod
+    def response_cache_key(collection_name: str, query: str) -> Tuple[str, str, str, str]:
+        return (
+            collection_name or "Default",
+            RAGEngine._normalize_cache_query(query),
+            settings.GEMINI_MODEL,
+            settings.EMBEDDING_MODEL,
+        )
+
+    @staticmethod
+    def get_cached_response(cache_key: Tuple[str, str, str, str]) -> Optional[Tuple[str, List[Dict[str, Any]]]]:
+        if not settings.RAG_CACHE_ENABLED:
+            return None
+
+        now = time.time()
+        ttl = max(1, settings.RAG_CACHE_TTL_SECONDS)
+        with RAGEngine._response_cache_lock:
+            cached = RAGEngine._response_cache.get(cache_key)
+            if not cached:
+                return None
+            created_at, response_text, chunks = cached
+            if now - created_at > ttl:
+                RAGEngine._response_cache.pop(cache_key, None)
+                return None
+            RAGEngine._response_cache.move_to_end(cache_key)
+            logger.info("RAG response cache hit.")
+            return response_text, copy.deepcopy(chunks)
+
+    @staticmethod
+    def set_cached_response(cache_key: Tuple[str, str, str, str], response_text: str, chunks: List[Dict[str, Any]]) -> None:
+        if not settings.RAG_CACHE_ENABLED or not response_text or not chunks:
+            return
+        if "information is not available" in response_text.lower():
+            return
+
+        max_entries = max(1, settings.RAG_CACHE_MAX_ENTRIES)
+        with RAGEngine._response_cache_lock:
+            RAGEngine._response_cache[cache_key] = (time.time(), response_text, copy.deepcopy(chunks))
+            RAGEngine._response_cache.move_to_end(cache_key)
+            while len(RAGEngine._response_cache) > max_entries:
+                RAGEngine._response_cache.popitem(last=False)
+
+    @staticmethod
+    def _context_limit_for_query(query: str) -> int:
+        broad_patterns = (
+            r"\bprocess\b",
+            r"\bsteps?\b",
+            r"\bworkflow\b",
+            r"\bhow\b",
+            r"\bconfigure\b",
+            r"\bconfiguration\b",
+            r"\bcompare\b",
+            r"\bexplain\b.*\bprocess\b",
+        )
+        if any(re.search(pattern, query or "", re.IGNORECASE) for pattern in broad_patterns):
+            return max(settings.RAG_DEFAULT_TOP_K, settings.RAG_BROAD_TOP_K)
+        return settings.RAG_DEFAULT_TOP_K
+
+    @staticmethod
+    def _trim_context_chunks(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        char_limit = max(500, settings.RAG_CONTEXT_CHARS_PER_CHUNK)
+        trimmed = []
+        for chunk in chunks:
+            copied = dict(chunk)
+            text = copied.get("text", "") or ""
+            if len(text) > char_limit:
+                copied["text"] = text[:char_limit].rsplit(" ", 1)[0].rstrip() + "\n[Context trimmed for speed.]"
+            trimmed.append(copied)
+        return trimmed
+
     @staticmethod
     def expand_query(query: str) -> str:
         """
@@ -86,6 +209,11 @@ class RAGEngine:
            child. Legacy flat chunks (no parent) keep their own text.
         """
         hybrid_search_start = time.perf_counter()
+        cache_key = RAGEngine._cache_key(collection_name, query, limit)
+        cached_results = RAGEngine._get_cached_retrieval(cache_key)
+        if cached_results is not None:
+            return cached_results
+
         # 1. Query Expansion
         expanded_query = RAGEngine.expand_query(query)
         logger.info(f"Executing hybrid search for query: '{query}' (Expanded: '{expanded_query}')")
@@ -196,6 +324,7 @@ class RAGEngine:
         logger.info(
             f"[timing] hybrid_search.total duration_ms={(time.perf_counter() - hybrid_search_start) * 1000:.1f}"
         )
+        RAGEngine._set_cached_retrieval(cache_key, final_results)
         return final_results
 
     @staticmethod
@@ -547,7 +676,8 @@ ASSISTANT RESPONSE:"""
         `stream_response` instead (see Phase 3 CLAUDE.md entry).
         """
         # Retrieve context chunks
-        chunks = RAGEngine.hybrid_search(db, collection_name, query, limit=5)
+        chunks = RAGEngine.hybrid_search(db, collection_name, query, limit=RAGEngine._context_limit_for_query(query))
+        chunks = RAGEngine._trim_context_chunks(chunks)
 
         if not chunks:
             return "The requested information is not available in the current SAP knowledge base.", []
@@ -714,7 +844,19 @@ ASSISTANT RESPONSE:"""
         retrieved chunks -> emit the canned string directly without calling
         any LLM), which covers the common case. See CLAUDE.md Phase 3 entry.
         """
-        chunks = RAGEngine.hybrid_search(db, collection_name, query, limit=5)
+        if not conversation_history:
+            cached_response = RAGEngine.get_cached_response(RAGEngine.response_cache_key(collection_name, query))
+            if cached_response:
+                response_text, cached_chunks = cached_response
+                if chunks_out is not None:
+                    chunks_out.extend(cached_chunks)
+                yield {"type": "status", "message": "Using cached answer..."}
+                yield response_text
+                return
+
+        yield {"type": "status", "message": "Searching knowledge base..."}
+        chunks = RAGEngine.hybrid_search(db, collection_name, query, limit=RAGEngine._context_limit_for_query(query))
+        chunks = RAGEngine._trim_context_chunks(chunks)
         if chunks_out is not None:
             chunks_out.extend(chunks)
 
@@ -722,6 +864,7 @@ ASSISTANT RESPONSE:"""
             yield "The requested information is not available in the current SAP knowledge base."
             return
 
+        yield {"type": "status", "message": "Generating answer..."}
         prompt = RAGEngine._build_prompt(chunks, conversation_history, query)
         yield from RAGEngine._stream_llm_response(prompt, chunks)
 
