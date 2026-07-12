@@ -732,3 +732,117 @@ per-item verification notes below.
 - No live LLM/reranker model download was exercised; the cross-encoder path
   is verified by code review + mocked-class logic tests only, as noted
   above.
+
+### 2026-07-12 — Phase 5: Chunk granularity tracking + heading-regex fix
+
+**Environment note**: `backend/venv/` (a project-local virtualenv already
+present in the repo) has real `fastapi`, `pytest`, `pymupdf` (`fitz`), and
+the rest of `requirements.txt` installed — unlike the sandboxes used for
+Phases 0-4's subagents, which lacked `fastapi`/`pytest`/`sentence-transformers`
+and relied on `python -m unittest` plus mocked logic tests. This phase's
+verification ran directly against real parsed PDF text from `public/` using
+`backend/venv/Scripts/python.exe`, and `backend/tests/test_basic.py` passed
+via real `pytest` (3/3). **Recommendation for future phases**: use
+`backend\venv\Scripts\python.exe` / `pytest` directly instead of assuming
+these packages are unavailable — this closes several "unverified against
+real X" gaps noted in Phases 0-4's entries above (worth re-verifying those
+Postgres-only migration paths' Python-side logic, and the reranker/embedding
+code paths, against this venv in a later pass, though a live Postgres/Qdrant
+instance is still needed for the DB-server-side DDL itself).
+
+**1. `Document.chunk_size`/`chunk_overlap` tracking**: added both columns
+(nullable `Integer`) to `backend/app/models/models.py`, migration
+`backend/alembic/versions/7c1e4f2a9d3b_phase5_chunk_granularity.py`
+(verified full upgrade/downgrade/re-upgrade round-trip against scratch
+SQLite, including inserting a `Document` row with both fields set). All
+three ingestion entry points now pass `chunk_size`/`chunk_overlap` as
+explicit named values (instead of relying on the chunker's implicit
+defaults) and persist them onto the `Document` row: `backend/app/api
+/documents.py`'s `process_document_ingestion` (450/80, the chunker's
+defaults), `backend/seed_spec.py` (same), `backend/ingest_public_pdfs.py`
+(1200/200, unchanged from before — now just recorded).
+
+**2. Heading-regex false-positive fix in `backend/app/services/chunker.py`**
+— **the original review's hypothesis (running headers/footers repeating on
+every page, e.g. a printed document title) was investigated empirically
+against the real PDFs in `public/` and found to be WRONG.** What actually
+happens: repeated per-page lines (a date stamp on every page of `MDG100.pdf`,
+plain page-number footers) do **not** match the heading regex at all — they
+were a red herring in the original review, which was based on a stale
+`ingest_log.txt` artifact from before someone had already substantially
+rewritten `chunker.py` into the current semantic/token-aware version found
+in this repo's pre-existing (uncommitted-at-session-start) working tree.
+
+Running the **current** chunker directly against the three large PDFs in
+`public/` (chunk_size=1200, overlap=200, matching `ingest_public_pdfs.py`)
+showed `MDG100.pdf` and `MDG101.pdf` already merging reasonably well (502
+and 8 chunks respectively, not 1:1 with page count), but
+`SAP MDG Master Data Governance The Comprehensive Guide.pdf` still showed
+1132 chunks from 1234 pages — close to the old 1:1 pattern. Root-caused by
+counting heading-type segments per page: only 39 of 1234 pages (3%) had
+more than 3 heading-regex matches (Table of Contents, Index, and a
+transaction-code reference-list page with 49 matches on one page alone),
+but those 39 pages alone accounted for 758 of the 1132 total chunks (67%).
+The mechanism: ToC/Index lines like `"6.3.2   Simple Checks in..."` match
+the exact same `\d+(\.\d+)*\s+[A-Z][A-Za-z ]{5,70}` numbered-heading
+pattern as a real section heading, and the chunker flushes the buffer on
+every heading — so a page densely packed with 20-49 such listing lines
+produces 20-49 near-empty chunks.
+
+**Fix 1** (`_classify_segments`): when a heading-matching line is found,
+look ahead for a run of consecutive heading-matching lines (no intervening
+blank/non-matching line). A run of `_TOC_RUN_THRESHOLD = 3` or more is
+folded into a single `"text"` segment instead of N individual `"heading"`
+segments, since an isolated real heading in body prose is never
+back-to-back with 2+ other heading-pattern lines the way a listing is.
+
+**Fix 2** (`_UPPER_HEADING_RE`): added a `(?=.*\s)` lookahead requiring at
+least one space, so isolated single-token uppercase strings (SAP field
+names like `WERKS`/`TXTMI`, T-code IDs like `BCSAP1`/`WS75700040`) stop
+matching as headings — these were flushing the buffer even when NOT part of
+a dense run (interspersed with ordinary mixed-case prose lines, so Fix 1's
+run-detection didn't catch them). Multi-word short headings (`UNIT 1`,
+`TARGET AUDIENCE`, `LESSON OBJECTIVES`) are unaffected since they contain a
+space.
+
+**Measured effect** (both fixes combined, same 1200/200 params, real parsed
+text from `public/`, via `backend/venv`):
+
+| Document | Pages | Chunks before | Chunks after |
+|---|---|---|---|
+| MDG100.pdf | 1017 | ~1017 (per stale `ingest_log.txt`) / 502 (current code, before this fix) | **364** |
+| MDG101.pdf | 148 | ~148 (stale log) / 8 (current code, before this fix) | **8** (unchanged, already healthy) |
+| SAP MDG ... Comprehensive Guide.pdf | 1234 | 1132 (current code, before this fix) | **383** |
+
+`backend/tests/test_basic.py` passes (3/3, real `pytest` via `backend/venv`).
+
+**Follow-ups for later phases**:
+- Existing chunks/vectors from any prior ingestion run are **not**
+  retroactively reprocessed by this fix — documents need to be re-uploaded
+  (or `ingest_public_pdfs.py` re-run after clearing the old rows) to benefit.
+  Not automated here, per the plan's explicit scope note (a data-ops task,
+  not a code fix).
+- `ingest_log.txt` in the repo is now stale/misleading (reflects an older,
+  pre-rewrite version of `chunker.py`) — left as-is (it's a historical log,
+  not something the app reads), but don't use its numbers as current-state
+  evidence in future reviews.
+- A third, smaller false-positive source was noticed but not fixed (out of
+  scope / diminishing returns): a handful of pages still show 1-3 heading
+  matches from things like figure/table captions ("Figure 6.29 ...") that
+  technically fit the heading patterns but aren't run-length-3+ and aren't
+  single uppercase tokens. Low impact (average chunk size after this fix is
+  already reasonable, 640-1064 tokens against a 1200 target) — not pursued
+  further.
+
+**Unrelated finding, not acted on**: while working in this phase, `git
+status` showed a large (~530 line) uncommitted diff across
+`frontend/app/{admin,auth,chat}/page.tsx` and `frontend/app/globals.css` —
+a cosmetic/functional UI pass (login page redesign, drag-and-drop upload,
+delete-confirmation modal, file-type badges) that neither this phase nor
+any prior phase's task touched or authored. Reviewed for safety (no network
+calls, no credential handling, nothing suspicious) but **deliberately left
+uncommitted and unexplained** rather than folded into this phase's commit —
+its origin is unknown. If you're reading this in a future session and don't
+recognize this diff either, ask the user before committing or discarding
+it; don't assume it's safe to fold into unrelated work just because it
+looks benign.
