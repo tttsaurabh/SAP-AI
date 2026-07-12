@@ -1,9 +1,14 @@
 import re
-import json
-import os
 from typing import Dict, Any, List, Optional
 
 class SAPAgenticService:
+    # In-memory stand-in for a session/token cache. This is demo-only data
+    # (see authenticate_notes_server below) and was previously persisted to
+    # a plaintext token-cache.json file on disk; there's no reason fake
+    # simulated credentials should survive a process restart or live on
+    # disk, so this is now a module-level dict instead.
+    _TOKEN_CACHE: Dict[str, Any] = {}
+
     # A local dictionary of simulated standard SAP Notes
     SIMULATED_NOTES = {
         "2187425": {
@@ -113,9 +118,13 @@ class SAPAgenticService:
     def authenticate_notes_server(auth_mode: str, username: Optional[str] = None, password: Optional[str] = None) -> Dict[str, Any]:
         """
         Simulates SNOTE dual-mode authentication server (Model Context Protocol).
+
+        This is demo authentication only: any non-empty username/password is
+        accepted and no real SAP Support Portal / S-user connection is ever
+        made. The resulting fake session is cached in-memory only
+        (SAPAgenticService._TOKEN_CACHE) for the lifetime of the process —
+        it is never written to disk.
         """
-        token_cache_path = "./token-cache.json"
-        
         if auth_mode == "certificate":
             # PFX TLS handshake login
             session_cookie = "sec-session-cert-mode-99281a88bb3e72"
@@ -127,15 +136,15 @@ class SAPAgenticService:
             session_cookie = "sec-session-credentials-mode-1122aa77bb"
             status = "Authenticated via Credentials (IAS Login Mode)"
 
-        # Save session to token cache
+        # Cache session in-memory only (demo data, not persisted to disk)
         cache_data = {
             "session_cookie": session_cookie,
             "auth_mode": auth_mode,
             "user": username or "SAP Passport SSL Certificate",
             "expires_in_hours": 24
         }
-        with open(token_cache_path, "w") as f:
-            json.dump(cache_data, f, indent=2)
+        SAPAgenticService._TOKEN_CACHE.clear()
+        SAPAgenticService._TOKEN_CACHE.update(cache_data)
 
         return {
             "success": True,

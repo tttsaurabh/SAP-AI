@@ -6,8 +6,21 @@ import { api, getAuthToken, getUserRole } from "@/lib/api";
 import { 
   ArrowLeft, Terminal, AlertTriangle, CheckCircle, HelpCircle, Info,
   Settings, Key, Download, Cpu, Play, RefreshCw, FileCode, Check, Copy,
-  Network, Share2, Layers, ShieldAlert, CheckSquare, ListTodo, LogIn
+  Network, Share2, Layers, ShieldAlert, CheckSquare, ListTodo, LogIn, FlaskConical
 } from "lucide-react";
+
+// Small inline badge shown next to any panel that renders data from a
+// simulated/demo backend response (i.e. the response included
+// `simulated: true`). Complements the persistent page-level banner below —
+// it doesn't replace it.
+function SimulatedBadge() {
+  return (
+    <span className="inline-flex items-center gap-1 rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[9px] font-bold uppercase tracking-wide text-amber-400">
+      <FlaskConical className="h-3 w-3" />
+      Simulated
+    </span>
+  );
+}
 
 export default function WorkbenchPage() {
   const router = useRouter();
@@ -215,7 +228,16 @@ export default function WorkbenchPage() {
 
       {/* Main Container */}
       <div className="flex-1 flex flex-col h-full overflow-hidden relative z-10">
-        
+
+        {/* Persistent simulation-mode banner — not dismissable, always visible */}
+        <div className="flex shrink-0 items-center gap-2.5 border-b border-amber-500/25 bg-amber-500/10 px-6 py-2.5 text-[11px] font-semibold text-amber-300">
+          <AlertTriangle className="h-4 w-4 shrink-0 text-amber-400" />
+          <span>
+            SIMULATION MODE — SAP Agentic Workbench uses hardcoded demo data (SNOTE search,
+            diagnostics, ABAP validation, transition guide) and does not connect to a real SAP system.
+          </span>
+        </div>
+
         {/* Top Header */}
         <header className="flex h-16 items-center justify-between border-b border-slate-800/60 bg-slate-950/20 px-6 backdrop-blur-md">
           <div className="flex items-center gap-3">
@@ -356,8 +378,11 @@ export default function WorkbenchPage() {
                   <div className="space-y-6">
                     {/* Header summary card */}
                     <div className="bg-slate-950/40 border border-slate-800/80 p-5 rounded-2xl space-y-4">
-                      <h3 className="text-xs font-bold uppercase tracking-widest text-slate-500">Diagnostic Summary</h3>
-                      
+                      <div className="flex items-center justify-between">
+                        <h3 className="text-xs font-bold uppercase tracking-widest text-slate-500">Diagnostic Summary</h3>
+                        {diagResult.simulated && <SimulatedBadge />}
+                      </div>
+
                       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
                         <div className="bg-slate-950 p-3.5 rounded-xl border border-slate-900 text-center">
                           <p className="text-[10px] text-slate-500 font-bold uppercase">Exception</p>
@@ -443,6 +468,11 @@ export default function WorkbenchPage() {
                   <h2 className="text-sm font-bold text-white uppercase tracking-wider">Identity Backbone Session</h2>
                 </div>
 
+                <div className="flex items-start gap-2 rounded-lg border border-amber-500/20 bg-amber-500/5 p-2.5 text-[10px] leading-relaxed text-amber-300/90">
+                  <AlertTriangle className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+                  <span>Demo authentication — any credentials are accepted; no real SAP Support Portal connection is made.</span>
+                </div>
+
                 <div className="space-y-1.5">
                   <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Authentication Protocol</label>
                   <div className="grid grid-cols-2 gap-2 bg-slate-950 p-1.5 rounded-xl border border-slate-800">
@@ -507,12 +537,15 @@ export default function WorkbenchPage() {
 
                 {authStatus && (
                   <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/20 space-y-2 text-xs">
-                    <div className="flex items-center gap-2 text-emerald-400 font-semibold">
-                      <CheckCircle className="h-4.5 w-4.5" />
-                      <span>{authStatus.status}</span>
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 text-emerald-400 font-semibold">
+                        <CheckCircle className="h-4.5 w-4.5" />
+                        <span>{authStatus.status}</span>
+                      </div>
+                      {authStatus.simulated && <SimulatedBadge />}
                     </div>
                     <div className="bg-slate-950/80 p-2 rounded border border-slate-900 text-[10px] text-slate-500 font-mono break-all leading-tight">
-                      Saved to token-cache.json: {authStatus.session_cookie}
+                      Cached in-memory (demo session, not persisted to disk): {authStatus.session_cookie}
                     </div>
                   </div>
                 )}
@@ -563,6 +596,9 @@ export default function WorkbenchPage() {
 
                 {noteResult && (
                   <div className="space-y-4 pt-2">
+                    <div className="flex justify-end">
+                      {noteResult.simulated && <SimulatedBadge />}
+                    </div>
                     {/* Low release alert */}
                     {noteResult.low_release_warning && (
                       <div className="flex gap-3 bg-red-500/10 border border-red-500/25 p-4 rounded-xl text-xs text-red-400 leading-relaxed">
@@ -678,7 +714,10 @@ export default function WorkbenchPage() {
                     
                     {/* Score card */}
                     <div className="bg-slate-950/40 border border-slate-800/80 p-5 rounded-2xl space-y-4">
-                      <h3 className="text-xs font-bold uppercase tracking-widest text-slate-500">Grading Output</h3>
+                      <div className="flex items-center justify-between">
+                        <h3 className="text-xs font-bold uppercase tracking-widest text-slate-500">Grading Output</h3>
+                        {valResult.simulated && <SimulatedBadge />}
+                      </div>
                       <div className="flex items-center gap-4">
                         <div className={`h-16 w-16 rounded-2xl flex flex-col items-center justify-center font-extrabold text-lg border shadow-lg ${
                           valResult.grade === "Level A" ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-400 shadow-emerald-500/5" :
@@ -763,7 +802,10 @@ export default function WorkbenchPage() {
               
               <div className="bg-slate-950/40 border border-slate-800/80 p-6 rounded-2xl space-y-4">
                 <div className="space-y-1 border-b border-slate-850 pb-4">
-                  <h2 className="text-base font-bold text-white uppercase tracking-wider">Cloud-Ready Switch & Transition Guide</h2>
+                  <div className="flex items-center justify-between gap-2">
+                    <h2 className="text-base font-bold text-white uppercase tracking-wider">Cloud-Ready Switch & Transition Guide</h2>
+                    {guideData?.simulated && <SimulatedBadge />}
+                  </div>
                   <p className="text-xs text-slate-500 leading-normal">
                     To activate Cloud-Ready mode inside S/4HANA instances, follow this customization guideline derived from implementation logs.
                   </p>
@@ -867,7 +909,10 @@ export default function WorkbenchPage() {
                     <div className="bg-slate-950/40 border border-slate-800/80 p-5 rounded-2xl space-y-3">
                       <div className="flex items-center justify-between border-b border-slate-850 pb-2">
                         <h4 className="text-xs font-bold uppercase tracking-widest text-slate-500">Secure Network Topology Diagram</h4>
-                        <span className="text-[9px] font-bold text-slate-500 uppercase tracking-wider">PROTOCOL: {intResult.protocol}</span>
+                        <div className="flex items-center gap-2">
+                          {intResult.simulated && <SimulatedBadge />}
+                          <span className="text-[9px] font-bold text-slate-500 uppercase tracking-wider">PROTOCOL: {intResult.protocol}</span>
+                        </div>
                       </div>
                       
                       {/* ASCII Diagram representation */}

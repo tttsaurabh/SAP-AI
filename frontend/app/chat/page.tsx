@@ -4,8 +4,8 @@ import React, { useState, useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { api, getAuthToken, getUserRole, getUserEmail, clearAuthToken, Message, Conversation, Citation } from "@/lib/api";
 import { 
-  MessageSquare, Plus, LogOut, Send, Bot, User as UserIcon, BookOpen, 
-  Settings, ThumbsUp, ThumbsDown, Copy, Download, Moon, Sun, 
+  MessageSquare, Plus, LogOut, Send, Bot, User as UserIcon, BookOpen,
+  Settings, ThumbsUp, ThumbsDown, Copy, Download, Moon, Sun,
   ChevronRight, RefreshCw, X, FileText, Check, Terminal, Database, ArrowDown, Search, Layers
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
@@ -313,13 +313,18 @@ export default function ChatPage() {
             <p className="text-[10px] font-bold text-indigo-400 uppercase tracking-wide">{userRole}</p>
           </div>
           <div className="flex items-center gap-1.5">
-            <button 
-              onClick={() => router.push("/workbench")}
-              title="SAP Agentic Workbench"
-              className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-800 bg-slate-900/40 text-slate-400 hover:text-indigo-400 hover:border-indigo-500/35 transition-all"
-            >
-              <Terminal className="h-4 w-4" />
-            </button>
+            <div className="relative">
+              <button
+                onClick={() => router.push("/workbench")}
+                title="SAP Agentic Workbench (simulation/demo mode — not connected to a real SAP system)"
+                className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-800 bg-slate-900/40 text-slate-400 hover:text-indigo-400 hover:border-indigo-500/35 transition-all"
+              >
+                <Terminal className="h-4 w-4" />
+              </button>
+              <span className="pointer-events-none absolute -top-1.5 -right-1.5 rounded-full bg-amber-500 px-1 text-[7px] font-bold leading-tight text-slate-950">
+                DEMO
+              </span>
+            </div>
             {isAdminOrManager && (
               <button 
                 onClick={() => router.push("/admin")}

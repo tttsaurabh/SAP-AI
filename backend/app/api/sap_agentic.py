@@ -34,7 +34,7 @@ def analyze_dump(
     current_user: User = Depends(any_authenticated)
 ):
     try:
-        return SAPAgenticService.analyze_runtime_dump(request.dump_text)
+        return {**SAPAgenticService.analyze_runtime_dump(request.dump_text), "simulated": True}
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -47,7 +47,7 @@ def search_notes(
     current_user: User = Depends(any_authenticated)
 ):
     try:
-        return SAPAgenticService.get_note_details(request.note_number, request.sap_basis_version)
+        return {**SAPAgenticService.get_note_details(request.note_number, request.sap_basis_version), "simulated": True}
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -60,9 +60,12 @@ def authenticate_notes(
     current_user: User = Depends(any_authenticated)
 ):
     try:
-        return SAPAgenticService.authenticate_notes_server(
-            request.auth_mode, request.username, request.password
-        )
+        return {
+            **SAPAgenticService.authenticate_notes_server(
+                request.auth_mode, request.username, request.password
+            ),
+            "simulated": True,
+        }
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -75,7 +78,7 @@ def validate_code(
     current_user: User = Depends(any_authenticated)
 ):
     try:
-        return SAPAgenticService.validate_abap_code(request.code_text)
+        return {**SAPAgenticService.validate_abap_code(request.code_text), "simulated": True}
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -130,7 +133,8 @@ def get_transition_guide(
             "Parallel Active Areas verification in database tables.",
             "Classic UI mapping checks (Web Dynpro and Floorplan Manager coexistence alongside Fiori Elements).",
             "BAdI replication checks: review legacy validations in USMD_RULE_SERVICE for compatibility."
-        ]
+        ],
+        "simulated": True
     }
 
 @router.post("/integration-spec")
@@ -199,4 +203,4 @@ def get_integration_spec(
             status_code=400,
             detail=f"Unknown integration target system: {request.target_system}"
         )
-    return selected
+    return {**selected, "simulated": True}

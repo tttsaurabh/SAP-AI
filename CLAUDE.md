@@ -65,7 +65,17 @@ Do not describe it as connected to a real SAP system.
   `frontend/app/workbench/`): SNOTE search, ABAP validation, transition
   guide, and diagnostics all run against a hardcoded `SIMULATED_NOTES` dict
   and canned logic. There is **no real SAP system connection** (no RFC, no
-  live SNOTE/OSS lookup). Do not present this as live integration.
+  live SNOTE/OSS lookup). Do not present this as live integration. **As of
+  Phase 6, this is now labeled in-app** (not just here in CLAUDE.md): a
+  persistent, non-dismissable "SIMULATION MODE" banner sits at the top of
+  `frontend/app/workbench/page.tsx`, a "DEMO" badge sits on the Workbench
+  nav link in `frontend/app/chat/page.tsx`, inline copy next to the SNOTE
+  auth panel calls out that any credentials are accepted, and every backend
+  endpoint response includes `"simulated": true` (surfaced as small
+  in-panel badges on the frontend) — see the Phase 6 Work Log entry. The
+  underlying behavior (hardcoded notes, any-credentials auth, regex-based
+  ABAP "validation", static transition/integration prose) is unchanged;
+  only the labeling changed.
 
 ## Known limitations
 
@@ -846,3 +856,78 @@ its origin is unknown. If you're reading this in a future session and don't
 recognize this diff either, ask the user before committing or discarding
 it; don't assume it's safe to fold into unrelated work just because it
 looks benign.
+
+### 2026-07-12 — Phase 6: Workbench demo labeling
+
+Non-security remediation addressing a trust/correctness problem flagged by
+the architecture review: the SAP Agentic Workbench looks like it's talking
+to a real SAP system (an "authentication" panel that silently accepts any
+non-empty username/password, static SNOTE/ABAP/transition/integration
+output presented with no visual distinction from real data) with nothing in
+the UI telling the user otherwise. This phase does **not** make the
+Workbench real (that's explicitly out of scope, a separate integration
+project) — it only makes the simulation visible and stops writing fake
+demo credentials to disk. Verified with `backend\venv\Scripts\python.exe -m
+pytest backend\tests\test_basic.py -q` (3/3 pass) and `npx tsc --noEmit` in
+`frontend/` (zero errors), plus a direct call to
+`SAPAgenticService.authenticate_notes_server(...)` confirming no
+`token-cache.json` is written to disk anymore.
+
+**1. Frontend labeling** (`frontend/app/workbench/page.tsx`,
+`frontend/app/chat/page.tsx`):
+- Added a persistent, non-dismissable amber banner
+  ("SIMULATION MODE — SAP Agentic Workbench uses hardcoded demo data...")
+  at the top of the Workbench page's main container, above the existing
+  header — always visible, not a toast/alert that can be dismissed.
+- Added inline copy directly under the "Identity Backbone Session" heading
+  in the SNOTE authentication panel: "Demo authentication — any
+  credentials are accepted; no real SAP Support Portal connection is
+  made." — this is the panel most likely to be mistaken for a real SAP
+  Support Portal / S-user login.
+- Fixed the post-auth result panel's copy, which previously said "Saved to
+  token-cache.json: ..." (now inaccurate, see backend section below) — now
+  reads "Cached in-memory (demo session, not persisted to disk): ...".
+- Added a small reusable `SimulatedBadge` component (amber pill, flask
+  icon) rendered next to each result panel's header whenever that
+  endpoint's response includes `simulated: true` — diagnostics summary,
+  SNOTE auth result, SNOTE note-lookup result, ABAP grading output,
+  transition guide, and integration topology diagram. This is
+  data-driven (keyed off the actual API response field, not a hardcoded
+  frontend assumption) and is additive to the page-level banner, not a
+  replacement for it.
+- `frontend/app/chat/page.tsx`: added a small amber "DEMO" badge
+  (absolute-positioned pill) on the Workbench nav icon button in the
+  sidebar header, and updated its `title` tooltip to mention
+  simulation/demo mode — visible before a user ever opens the Workbench
+  page. Confirmed via grep this is the only in-app link to `/workbench`.
+
+**2. Backend** (`backend/app/services/sap_agentic_service.py`,
+`backend/app/api/sap_agentic.py`):
+- `authenticate_notes_server` no longer writes the fake session/credentials
+  to a plaintext `token-cache.json` file on disk (`with open(token_cache_path,
+  "w") as f: json.dump(...)`). Replaced with an in-memory
+  `SAPAgenticService._TOKEN_CACHE` module/class-level dict, cleared and
+  repopulated on each call. No `token-cache.json` file existed anywhere in
+  the repo at the start of this phase (confirmed via `Glob` and `git
+  ls-files` — nothing to clean up or flag as tracked).
+- Added `"simulated": True` to the response payload of all six SAP Agentic
+  endpoints in `sap_agentic.py` (`/analyze-dump`, `/search-notes`,
+  `/authenticate-notes`, `/validate-code`, `/transition-guide`,
+  `/integration-spec`). None of these endpoints declared a typed Pydantic
+  `response_model` (checked `backend/app/schemas/schemas.py` — no SAP
+  Agentic response schemas exist there), so the field was added directly
+  to each endpoint's returned dict (`{**service_result, "simulated": True}`
+  for the four service-backed endpoints; added as a literal key in the
+  `/transition-guide` dict and via `{**selected, "simulated": True}` in
+  `/integration-spec`) rather than to `schemas.py`.
+
+**3. Housekeeping**: added `*.tsbuildinfo` to `.gitignore` — the
+verification `tsc --noEmit` run left a `frontend/tsconfig.tsbuildinfo`
+build-cache artifact that briefly showed up as an untracked file; excluded
+it rather than committing it.
+
+**Follow-ups for later phases**: none specific to this phase — the
+underlying simulated behavior (hardcoded `SIMULATED_NOTES`, any-credentials
+auth, regex/string-matching ABAP "validation", static transition/
+integration prose) is unchanged and still tracked as a separate, larger
+integration project if real SAP connectivity is ever pursued.
