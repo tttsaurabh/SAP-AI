@@ -45,3 +45,6 @@ public/
 # Temporary scratch files
 scratch/
 backend/scratch/
+
+# Local Render CLI Binary
+render.exe
