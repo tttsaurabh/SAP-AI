@@ -36,15 +36,15 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: str = ""
     
     # LLM Models and Timeouts
-    GEMINI_MODEL: str = "gemini-3.1-flash-lite"
+    GEMINI_MODEL: str = "gemini-2.0-flash-lite"
     OPENAI_MODEL: str = "gpt-4o-mini"
     ANTHROPIC_MODEL: str = "claude-3-5-sonnet-latest"
-    LLM_TIMEOUT_SECONDS: float = 10.0
+    LLM_TIMEOUT_SECONDS: float = 25.0
     
     # Ingestion Configurations
     UPLOADS_DIR: str = "./uploads"
     OCR_ENABLED: bool = False
-    EMBEDDING_MODEL: str = "local:sentence-transformers/all-MiniLM-L6-v2"
+    EMBEDDING_MODEL: str = "gemini:text-embedding-004"
     RERANK_ENABLED: bool = False
     RERANK_MODEL: str = ""
 
