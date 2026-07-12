@@ -38,3 +38,6 @@ Thumbs.db
 
 # Local Portable Git
 git/
+
+# Large source PDFs (kept locally, not pushed to GitHub)
+public/
