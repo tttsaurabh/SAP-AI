@@ -318,6 +318,7 @@ export default function ChatPage() {
                 onClick={() => router.push("/workbench")}
                 title="SAP Agentic Workbench (simulation/demo mode — not connected to a real SAP system)"
                 className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-800 bg-slate-900/40 text-slate-400 hover:text-indigo-400 hover:border-indigo-500/35 transition-all"
+                aria-label="Open SAP Agentic Workbench (simulation/demo mode)"
               >
                 <Terminal className="h-4 w-4" />
               </button>
@@ -326,10 +327,11 @@ export default function ChatPage() {
               </span>
             </div>
             {isAdminOrManager && (
-              <button 
+              <button
                 onClick={() => router.push("/admin")}
                 title="Knowledge Base Admin Panel"
                 className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-800 bg-slate-900/40 text-slate-400 hover:text-indigo-400 hover:border-indigo-500/35 transition-all"
+                aria-label="Open knowledge base admin panel"
               >
                 <Settings className="h-4 w-4" />
               </button>
@@ -405,6 +407,7 @@ export default function ChatPage() {
                   onClick={(e) => handleDeleteChat(c.id, e)}
                   className="opacity-0 group-hover:opacity-100 hover:text-red-400 p-0.5 transition-all"
                   title="Delete chat session"
+                  aria-label={`Delete conversation "${c.title}"`}
                 >
                   <X className="h-3.5 w-3.5" />
                 </button>
@@ -452,6 +455,7 @@ export default function ChatPage() {
                 onClick={exportChatMarkdown}
                 title="Export session to Markdown"
                 className="flex h-9 w-9 items-center justify-center rounded-lg border border-slate-800 bg-slate-900/40 text-slate-400 hover:text-indigo-400 transition-all"
+                aria-label="Export chat session to Markdown"
               >
                 <Download className="h-4 w-4" />
               </button>
@@ -526,6 +530,7 @@ export default function ChatPage() {
                               onClick={() => copyToClipboard(m.content, m.id)}
                               className="text-slate-400 hover:text-indigo-400 p-0.5"
                               title="Copy markdown text"
+                              aria-label="Copy message text"
                             >
                               {copiedId === m.id ? <Check className="h-3.5 w-3.5 text-emerald-400" /> : <Copy className="h-3.5 w-3.5" />}
                             </button>
@@ -586,6 +591,7 @@ export default function ChatPage() {
                             }}
                             className="rounded-lg hover:bg-slate-900 hover:text-emerald-400 text-slate-500 p-1.5 transition-all"
                             title="Helpful response"
+                            aria-label="Mark response as helpful"
                           >
                             <ThumbsUp className="h-3.5 w-3.5" />
                           </button>
@@ -596,6 +602,7 @@ export default function ChatPage() {
                             }}
                             className="rounded-lg hover:bg-slate-900 hover:text-red-400 text-slate-500 p-1.5 transition-all"
                             title="Unhelpful / hallucinated response"
+                            aria-label="Mark response as unhelpful"
                           >
                             <ThumbsDown className="h-3.5 w-3.5" />
                           </button>
@@ -615,6 +622,7 @@ export default function ChatPage() {
           <button
             onClick={scrollToBottom}
             className="absolute bottom-24 right-8 z-30 flex h-10 w-10 items-center justify-center rounded-full bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg transition-all animate-bounce"
+            aria-label="Scroll to bottom"
           >
             <ArrowDown className="h-5 w-5" />
           </button>
@@ -635,6 +643,7 @@ export default function ChatPage() {
                 type="submit"
                 disabled={loading || !query.trim()}
                 className="absolute right-3.5 flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-tr from-blue-600 via-indigo-600 to-purple-600 text-white shadow-md shadow-indigo-600/10 hover:opacity-95 active:scale-95 disabled:opacity-30 disabled:scale-100 transition-all"
+                aria-label="Send message"
               >
                 <Send className="h-4.5 w-4.5" />
               </button>
@@ -656,9 +665,10 @@ export default function ChatPage() {
                   <FileText className="h-5 w-5 text-indigo-400" />
                   <h3 className="font-bold text-white">Source Verification</h3>
                 </div>
-                <button 
+                <button
                   onClick={() => setSelectedCitation(null)}
                   className="text-slate-400 hover:text-white transition-all"
+                  aria-label="Close citation drawer"
                 >
                   <X className="h-5 w-5" />
                 </button>
@@ -707,9 +717,10 @@ export default function ChatPage() {
             <div className="w-full max-w-md rounded-2xl bg-slate-900 border border-slate-800 p-6 space-y-4 shadow-2xl">
               <div className="flex items-center justify-between">
                 <h3 className="font-bold text-white">Provide RAG Response Feedback</h3>
-                <button 
+                <button
                   onClick={() => setFeedbackMsgId(null)}
                   className="text-slate-400 hover:text-white"
+                  aria-label="Close feedback dialog"
                 >
                   <X className="h-5 w-5" />
                 </button>

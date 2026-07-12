@@ -191,6 +191,7 @@ export default function AdminPage() {
             <button
               onClick={() => router.push("/chat")}
               className="flex h-9 w-9 items-center justify-center rounded-lg border border-slate-800 bg-slate-900/40 text-slate-400 hover:text-white transition-all"
+              aria-label="Back to chat"
             >
               <ArrowLeft className="h-4 w-4" />
             </button>
@@ -430,6 +431,7 @@ export default function AdminPage() {
                               onClick={() => handleInspectChunks(doc)}
                               className="text-slate-400 hover:text-indigo-400 transition-all p-1"
                               title="Inspect document segments/chunks"
+                              aria-label={`Inspect chunks for ${doc.filename}`}
                             >
                               <Eye className="h-4 w-4 inline" />
                             </button>
@@ -448,6 +450,7 @@ export default function AdminPage() {
                                 onClick={() => setShowConfirmDeleteId(doc.id)}
                                 className="text-slate-400 hover:text-red-400 transition-all p-1"
                                 title="Remove document and embeddings"
+                                aria-label={`Delete ${doc.filename}`}
                               >
                                 <Trash2 className="h-4 w-4 inline" />
                               </button>
@@ -475,9 +478,10 @@ export default function AdminPage() {
                     <p className="text-[10px] text-slate-500 truncate">{selectedDocForInspection.filename}</p>
                   </div>
                 </div>
-                <button 
+                <button
                   onClick={() => setSelectedDocForInspection(null)}
                   className="text-slate-400 hover:text-white transition-all"
+                  aria-label="Close chunk inspector"
                 >
                   <X className="h-5 w-5" />
                 </button>

@@ -245,6 +245,7 @@ export default function WorkbenchPage() {
               onClick={() => router.push("/chat")}
               className="flex h-9 w-9 items-center justify-center rounded-lg border border-slate-800 bg-slate-900/50 text-slate-400 hover:text-white transition-all"
               title="Return to Chat"
+              aria-label="Return to chat"
             >
               <ArrowLeft className="h-4 w-4" />
             </button>
