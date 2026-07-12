@@ -26,6 +26,18 @@ except ImportError:
 try:
     from PIL import Image
     import pytesseract
+    if pytesseract:
+        # Standard Tesseract paths on Windows
+        std_paths = [
+            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+            r"C:\Users\tttsa\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
+        ]
+        for p in std_paths:
+            if os.path.exists(p):
+                pytesseract.pytesseract.tesseract_cmd = p
+                logger.info(f"Auto-configured Tesseract binary path: {p}")
+                break
 except ImportError:
     Image = None
     pytesseract = None
@@ -72,9 +84,13 @@ class DocumentParser:
                     text = page.get_text("text") or ""
                     # Check if we should try OCR for scanned/empty pages
                     if len(text.strip()) < 50 and pytesseract and Image:
-                        # Try OCR, but wrap in try-except so OCR unavailability doesn't fail the whole document
+                        # Try OCR, but wrap in try-except so OCR unavailability doesn't fail the whole document.
+                        # Rendered at 300 DPI (Phase 8c) -- the previous default
+                        # (72 DPI, i.e. no dpi= argument) produced pixmaps too
+                        # low-resolution for Tesseract to read small SAP-document
+                        # body text reliably.
                         try:
-                            pix = page.get_pixmap()
+                            pix = page.get_pixmap(dpi=300)
                             img_data = pix.tobytes("png")
                             img = Image.open(io.BytesIO(img_data))
                             ocr_text = pytesseract.image_to_string(img)
@@ -82,14 +98,47 @@ class DocumentParser:
                                 text = ocr_text
                         except Exception as ocr_e:
                             logger.debug(f"OCR failed for page {page_idx + 1}: {str(ocr_e)}")
-                    
+
+                    # Structured table extraction (Phase 8c): get_text("text")
+                    # above flattens tables into a linear text stream with no
+                    # column/row structure -- SAP config tables lose their
+                    # grid entirely. page.find_tables() (PyMuPDF >=1.23) detects
+                    # the table regions and to_markdown() renders each as a
+                    # pipe-delimited Markdown table, which is exactly the
+                    # format the chunker already treats as an atomic,
+                    # never-split segment (chunker.py's _TABLE_ROW_RE). The
+                    # markdown is appended after the flat text rather than
+                    # replacing it, so some cell text is duplicated between the
+                    # two -- acceptable for v1 (the markdown copy is the
+                    # structured, retrievable one); see the Phase 8 CLAUDE.md
+                    # Work Log entry for the documented follow-up (clip table
+                    # bboxes out of get_text to remove the duplication).
+                    has_tables = False
+                    try:
+                        found_tables = page.find_tables()
+                        if found_tables and found_tables.tables:
+                            table_md_parts = []
+                            for table in found_tables.tables:
+                                try:
+                                    md = table.to_markdown()
+                                    if md and md.strip():
+                                        table_md_parts.append(md.strip())
+                                except Exception as table_e:
+                                    logger.debug(f"Failed to render table on page {page_idx + 1}: {str(table_e)}")
+                            if table_md_parts:
+                                text = text + "\n\n" + "\n\n".join(table_md_parts)
+                                has_tables = True
+                    except Exception as find_e:
+                        logger.debug(f"Table detection failed for page {page_idx + 1}: {str(find_e)}")
+
                     pages.append({
                         "page": page_idx + 1,
                         "text": text,
                         "metadata": {
                             "source_type": "pdf",
                             "engine": "pymupdf",
-                            "headings": DocumentParser._extract_headings_from_text(text)
+                            "headings": DocumentParser._extract_headings_from_text(text),
+                            "has_tables": has_tables
                         }
                     })
                 doc.close()

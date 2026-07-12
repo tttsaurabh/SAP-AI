@@ -9,7 +9,7 @@ from app.core.database import SessionLocal, Base, engine
 from app.models.models import Document, Chunk
 from app.services.parser import DocumentParser
 from app.services.chunker import DocumentChunker
-from app.services.vector_db import VectorDBService
+from app.services.vector_db import get_vector_backend
 
 def seed_specification():
     target_dir = "./uploads"
@@ -33,7 +33,7 @@ def seed_specification():
         if existing_doc:
             print(f"Document {target_filename} already exists. Deleting to re-ingest...")
             # Delete vectors
-            VectorDBService.delete_document_vectors(existing_doc.collection_name, existing_doc.id)
+            get_vector_backend().delete_document_vectors(existing_doc.collection_name, existing_doc.id)
             # Delete DB record (cascade deletes chunks)
             db.delete(existing_doc)
             db.commit()
@@ -83,8 +83,8 @@ def seed_specification():
 
         print(f"Saved {len(db_chunks)} chunks to PostgreSQL database.")
 
-        # 7. Index chunks in Qdrant
-        VectorDBService.upsert_chunks(
+        # 7. Index chunks in vector DB
+        get_vector_backend().upsert_chunks(
             collection_name=collection_name,
             document_id=db_doc.id,
             filename=target_filename,

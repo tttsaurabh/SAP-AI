@@ -91,7 +91,7 @@ export default function ChatPage() {
 
   const loadCollections = async () => {
     try {
-      const roles = ["Super Admin", "SAP Knowledge Manager"];
+      const roles = ["Super Admin", "SAP Knowledge Manager", "SAP Consultant"];
       if (roles.includes(getUserRole())) {
         const data = await api.listCollections();
         setCollections(data);
@@ -290,7 +290,7 @@ export default function ChatPage() {
     URL.revokeObjectURL(url);
   };
 
-  const isAdminOrManager = ["Super Admin", "SAP Knowledge Manager"].includes(userRole);
+  const isAdminOrManager = ["Super Admin", "SAP Knowledge Manager", "SAP Consultant"].includes(userRole);
   
   // Filter sidebar chats based on search query
   const filteredConversations = conversations.filter(c => 

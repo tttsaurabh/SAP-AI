@@ -2,7 +2,7 @@ import datetime
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, Text, JSON, Computed
 from sqlalchemy import Enum as SQLAlchemyEnum
 from sqlalchemy.dialects.postgresql import TSVECTOR
-from sqlalchemy.orm import relationship, deferred
+from sqlalchemy.orm import relationship, deferred, backref
 from app.core.database import Base
 from app.core.roles import Role, DocumentStatus, MessageRole
 
@@ -76,6 +76,7 @@ class Document(Base):
     # CLAUDE.md Work Log entry.
     chunk_size = Column(Integer, nullable=True)
     chunk_overlap = Column(Integer, nullable=True)
+    parent_chunk_size = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
@@ -96,6 +97,8 @@ class Chunk(Base):
     # documents.py's upload flow and reused for both the vector upsert call
     # and this column, so id-generation logic lives in exactly one place.
     vector_id = Column(String, nullable=True)
+    parent_id = Column(Integer, ForeignKey("chunks.id", ondelete="CASCADE"), nullable=True, index=True)
+    is_parent = Column(Boolean, server_default="false", default=False, index=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     # Postgres-only generated column (Phase 4 full-text search fix, see
     # alembic/versions/e2a7c4f91b30_phase4_fulltext_search.py): computed by
@@ -126,6 +129,7 @@ class Chunk(Base):
     text_search = deferred(Column(TSVECTOR, Computed("to_tsvector('english', text)", persisted=True)))
 
     document = relationship("Document", back_populates="chunks")
+    parent = relationship("Chunk", remote_side=[id], backref=backref("children", cascade="all, delete-orphan"))
 
 class Conversation(Base):
     __tablename__ = "conversations"

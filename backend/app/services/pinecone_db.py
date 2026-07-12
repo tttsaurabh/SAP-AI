@@ -102,6 +102,8 @@ class PineconeDBService:
                 "page_number": chunk.get("page_number", 1),
                 "section_header": chunk.get("section_header", ""),
                 "collection_name": collection_name,
+                "chunk_id": chunk.get("chunk_id"),
+                "chunk_index": chunk.get("chunk_index")
             }
             vectors.append({"id": vector_id, "values": embeddings[i], "metadata": metadata})
 
@@ -160,6 +162,8 @@ class PineconeDBService:
                     "page_number": meta.get("page_number", 1),
                     "section_header": meta.get("section_header", ""),
                     "collection_name": meta.get("collection_name", collection_name),
+                    "chunk_id": meta.get("chunk_id"),
+                    "chunk_index": meta.get("chunk_index")
                 })
             logger.info(
                 f"Pinecone search in namespace '{namespace}' returned {len(results)} results."

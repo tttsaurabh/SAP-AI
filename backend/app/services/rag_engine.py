@@ -1,7 +1,8 @@
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any, Tuple
 from loguru import logger
-from sqlalchemy import func
+from sqlalchemy import func, tuple_
 from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models.models import Chunk, Document
@@ -57,44 +58,62 @@ class RAGEngine:
         """
         Retrieves relevant document chunks using hybrid search:
         1. Query expansion for SAP abbreviations.
-        2. Dense vector search in Qdrant.
-        3. Database keyword search (Postgres full-text search --
-           `plainto_tsquery`/`ts_rank` over the `chunks.text_search`
-           generated tsvector column; see `_db_keyword_search`. Replaces
-           the old SQL `ILIKE` full-table scan as of Phase 4).
-        4. Combines results using Reciprocal Rank Fusion (RRF).
+        2. Dense vector search (child-level chunks only -- see Phase 8b)
+           and (3) database keyword search run IN PARALLEL (Phase 8a): the
+           vector leg touches no SQLAlchemy `Session`, so it runs on a
+           worker thread while the keyword leg runs on the calling thread
+           against the shared `db` Session (Sessions are not thread-safe,
+           so it must stay put). Previously these ran strictly
+           sequentially.
+        4. Combines results using Reciprocal Rank Fusion (RRF), resolving
+           chunk_id/chunk_index from the vector payload (batched fallback
+           for any legacy vector missing them) instead of the old
+           per-hit `db.query(Chunk)` reconciliation query (the N+1 fixed
+           in Phase 8a).
         5. Context compression (deduplication).
         6. Optional cross-encoder reranking (`settings.RERANK_ENABLED`,
            Phase 4) over a widened RRF candidate pool, truncated to
            `limit` afterward. No-op when the flag is off -- RRF-order
-           truncation straight to `limit`, exactly as before.
+           truncation straight to `limit`, exactly as before. Reranking
+           happens on the precise child text, before parent expansion.
+        7. Small-to-big expansion (Phase 8b): each winning child chunk's
+           `text` is swapped for its parent chunk's fuller text (one
+           batched query), so the LLM gets broader context while
+           retrieval matching stayed precise on the small child. Citation
+           fields (chunk_id/page_number/section_header) stay pinned to the
+           child. Legacy flat chunks (no parent) keep their own text.
         """
         # 1. Query Expansion
         expanded_query = RAGEngine.expand_query(query)
         logger.info(f"Executing hybrid search for query: '{query}' (Expanded: '{expanded_query}')")
-        
-        # 2. Semantic Search using expanded query (routed to Pinecone or Qdrant)
+
         vector_backend = get_vector_backend()
-        semantic_results = vector_backend.search_similarity(collection_name, expanded_query, limit=limit * 3)
-        
-        # 3. Database Keyword Search using expanded query
-        keyword_results = RAGEngine._db_keyword_search(db, collection_name, expanded_query, limit=limit * 3)
-        
+
+        # 2-3. Parallelize the two independent retrieval legs (Phase 8a).
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            vector_future = executor.submit(
+                vector_backend.search_similarity, collection_name, expanded_query, limit * 3
+            )
+            keyword_results = RAGEngine._db_keyword_search(db, collection_name, expanded_query, limit=limit * 3)
+            semantic_results = vector_future.result()
+
+        # Batched resolution of chunk_id/chunk_index for any semantic hit
+        # whose vector payload doesn't carry them (legacy vectors upserted
+        # before Phase 8a added the fields) -- one query for the whole
+        # batch instead of one query per hit.
+        RAGEngine._resolve_missing_chunk_ids(db, semantic_results)
+
         # 4. Reciprocal Rank Fusion (RRF)
         # RRF formula: RRF_score = sum(1 / (k + rank)) where k = 60
         rrf_scores: Dict[Tuple[int, int], Dict[str, Any]] = {} # keyed by (document_id, chunk_index)
         k = 60
-        
+
         # Score semantic results
         for rank, hit in enumerate(semantic_results):
             doc_id = hit["document_id"]
-            # Find chunk row by checking database -- this reconciliation lookup
-            # already existed to recover chunk_index; extend it to also
-            # capture the real DB chunk_id, since the vector store payload
-            # itself carries no chunk_id (only text/doc/page/section).
-            chunk_obj = db.query(Chunk).filter(Chunk.document_id == doc_id, Chunk.text == hit["text"]).first()
-            chunk_idx = chunk_obj.chunk_index if chunk_obj else 0
-            hit["chunk_id"] = chunk_obj.id if chunk_obj else None
+            chunk_idx = hit.get("chunk_index")
+            if chunk_idx is None:
+                chunk_idx = 0
 
             key = (doc_id, chunk_idx)
             if key not in rrf_scores:
@@ -104,14 +123,11 @@ class RAGEngine:
                 }
             rrf_scores[key]["score"] += 1.0 / (k + rank + 1)
 
-        # Score keyword results
-        for rank, chunk in enumerate(keyword_results):
+        # Score keyword results (Chunk row + filename, joined in
+        # _db_keyword_search itself -- no per-miss Document lookup needed)
+        for rank, (chunk, filename) in enumerate(keyword_results):
             key = (chunk.document_id, chunk.chunk_index)
             if key not in rrf_scores:
-                # Find document filename
-                doc = db.query(Document).filter(Document.id == chunk.document_id).first()
-                filename = doc.filename if doc else "Unknown"
-
                 rrf_scores[key] = {
                     "chunk": {
                         "chunk_id": chunk.id,
@@ -125,7 +141,7 @@ class RAGEngine:
                     "score": 0.0
                 }
             rrf_scores[key]["score"] += 1.0 / (k + rank + 1)
-            
+
         # 5. Sort and Deduplicate / Compress
         sorted_hits = sorted(rrf_scores.values(), key=lambda x: x["score"], reverse=True)
 
@@ -147,18 +163,95 @@ class RAGEngine:
                 if len(final_results) >= fusion_limit:
                     break
 
-        # 6. Optional cross-encoder reranking (Phase 4). `Reranker.rerank`
-        # itself also no-ops when RERANK_ENABLED is false, so this call is
-        # always safe to make; the fusion_limit widening above is the only
-        # actual behavior gated on the flag.
+        # 6. Optional cross-encoder reranking (Phase 4), on the precise
+        # child text (before parent expansion widens it -- a cross-encoder
+        # scores small, focused text more reliably than a loose parent
+        # passage). `Reranker.rerank` itself also no-ops when
+        # RERANK_ENABLED is false, so this call is always safe to make; the
+        # fusion_limit widening above is the only actual behavior gated on
+        # the flag.
         final_results = Reranker.rerank(query, final_results)
         final_results = final_results[:limit]
 
-        logger.info(f"Hybrid search returned {len(final_results)} fused and compressed results")
+        # 7. Small-to-big expansion (Phase 8b).
+        final_results = RAGEngine._expand_to_parents(db, final_results)
+
+        logger.info(f"Hybrid search returned {len(final_results)} fused, reranked, and expanded results")
         return final_results
 
     @staticmethod
-    def _db_keyword_search(db: Session, collection_name: str, query: str, limit: int = 10) -> List[Chunk]:
+    def _resolve_missing_chunk_ids(db: Session, semantic_results: List[Dict[str, Any]]) -> None:
+        """
+        Batched fallback (Phase 8a) for vector hits whose payload doesn't
+        carry `chunk_id`/`chunk_index` -- e.g. vectors upserted before
+        these fields were added to the payload schema in
+        vector_db.py/pinecone_db.py/supabase_db.py. Resolves the whole
+        batch of such hits with a single `db.query(Chunk)` filtered by
+        `(document_id, text)` pairs, instead of the old one-query-per-hit
+        reconciliation lookup. Hits that already carry a chunk_id are left
+        untouched. Mutates `semantic_results` in place.
+        """
+        missing = [h for h in semantic_results if h.get("chunk_id") is None]
+        if not missing:
+            return
+
+        keys = {(h["document_id"], h["text"]) for h in missing}
+        rows = (
+            db.query(Chunk.id, Chunk.document_id, Chunk.text, Chunk.chunk_index)
+            .filter(tuple_(Chunk.document_id, Chunk.text).in_(keys))
+            .all()
+        )
+        lookup = {(r.document_id, r.text): (r.id, r.chunk_index) for r in rows}
+
+        for hit in missing:
+            resolved = lookup.get((hit["document_id"], hit["text"]))
+            if resolved:
+                hit["chunk_id"], hit["chunk_index"] = resolved
+            else:
+                hit["chunk_id"] = None
+                hit.setdefault("chunk_index", 0)
+
+    @staticmethod
+    def _expand_to_parents(db: Session, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Small-to-big expansion (Phase 8b): swaps each winning child chunk's
+        `text` for its parent chunk's fuller text, in two batched queries
+        total (bounded by `len(results)`, which is already truncated to
+        `limit`) -- not a per-result query. Citation-relevant fields
+        (chunk_id/page_number/section_header) are left pointing at the
+        child for citation precision; only `text` (what actually reaches
+        the LLM prompt and the citation snippet) is swapped.
+
+        A chunk with `parent_id IS NULL` -- either a legacy flat chunk
+        ingested before Phase 8b, or a keyword-leg hit that for some
+        reason resolved with no parent -- keeps its own text unchanged.
+        """
+        chunk_ids = [r["chunk_id"] for r in results if r.get("chunk_id") is not None]
+        if not chunk_ids:
+            return results
+
+        children = db.query(Chunk.id, Chunk.parent_id).filter(Chunk.id.in_(chunk_ids)).all()
+        child_to_parent = {c.id: c.parent_id for c in children}
+
+        parent_ids = {pid for pid in child_to_parent.values() if pid is not None}
+        parent_text_by_id: Dict[int, str] = {}
+        if parent_ids:
+            parent_rows = db.query(Chunk.id, Chunk.text).filter(Chunk.id.in_(parent_ids)).all()
+            parent_text_by_id = {p.id: p.text for p in parent_rows}
+
+        for r in results:
+            chunk_id = r.get("chunk_id")
+            parent_id = child_to_parent.get(chunk_id) if chunk_id is not None else None
+            if parent_id is not None and parent_id in parent_text_by_id:
+                r["text"] = parent_text_by_id[parent_id]
+            # else: no parent on record -- keep the chunk's own text as-is.
+
+        return results
+
+    @staticmethod
+    def _db_keyword_search(
+        db: Session, collection_name: str, query: str, limit: int = 10
+    ) -> List[Tuple[Chunk, str]]:
         """
         Real Postgres full-text search (Phase 4 non-security remediation),
         replacing the previous `Chunk.text.ilike('%word%')` full-table
@@ -170,6 +263,16 @@ class RAGEngine:
         operator uses the GIN index instead of scanning every row, and
         `ts_rank` gives real relevance-ordered results instead of an
         arbitrary DB-returned order over exact substring matches.
+
+        Returns `(Chunk, filename)` tuples -- `filename` comes from the
+        same `join(Document)` this query already performs, so the caller
+        (hybrid_search's RRF loop) doesn't need a second per-miss
+        `db.query(Document)` lookup (the other half of the N+1 eliminated
+        in Phase 8a).
+
+        Only matches child-level chunks (`is_parent == False`, Phase 8b) --
+        parents are reached exclusively via `_expand_to_parents`, never
+        surfaced directly by a keyword hit on their own (coarser) text.
 
         Postgres-only: `text_search`/`tsvector`/`ts_rank` have no SQLite
         equivalent, so this will error against a non-Postgres database --
@@ -183,10 +286,13 @@ class RAGEngine:
 
         tsquery = func.plainto_tsquery('english', query)
 
-        # Select chunks belonging to documents in the collection
-        query_filter = db.query(Chunk).join(Document)
-        query_filter = query_filter.filter(Document.collection_name == collection_name)
-        query_filter = query_filter.filter(Chunk.text_search.op('@@')(tsquery))
+        query_filter = (
+            db.query(Chunk, Document.filename)
+            .join(Document)
+            .filter(Document.collection_name == collection_name)
+            .filter(Chunk.is_parent.is_(False))
+            .filter(Chunk.text_search.op('@@')(tsquery))
+        )
 
         return (
             query_filter.order_by(func.ts_rank(Chunk.text_search, tsquery).desc())

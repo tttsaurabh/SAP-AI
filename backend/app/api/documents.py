@@ -2,12 +2,12 @@ import os
 import shutil
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, UploadFile, File, Form, status
 from sqlalchemy.orm import Session
-from typing import List
+from typing import List, Dict
 from loguru import logger
 
 from app.core.config import settings
 from app.core.database import get_db, SessionLocal
-from app.core.security import admin_only
+from app.core.security import consultant_or_above
 from app.core.roles import DocumentStatus
 from app.models.models import User, Document, Chunk, Collection
 from app.schemas.schemas import DocumentResponse
@@ -59,7 +59,7 @@ def _ensure_embedding_model_compatible(collection: Collection):
 @router.get("/", response_model=List[DocumentResponse])
 def list_documents(
     db: Session = Depends(get_db),
-    current_user: User = Depends(admin_only)
+    current_user: User = Depends(consultant_or_above)
 ):
     return db.query(Document).order_by(Document.created_at.desc()).all()
 
@@ -90,53 +90,102 @@ def process_document_ingestion(document_id: int, file_path: str, filename: str, 
         # 1. Parse File
         pages = DocumentParser.parse_file(file_path, filename)
 
-        # 2. Chunk File. Pass the chunker's defaults explicitly (rather than
-        # relying on them implicitly) so the exact values used can be
-        # persisted onto the Document row below -- see chunk_size/
-        # chunk_overlap on the model and the Phase 5 CLAUDE.md Work Log
-        # entry for why this matters (different ingestion entry points used
-        # different, previously-unrecorded values).
-        chunk_size = DocumentChunker.DEFAULT_CHUNK_SIZE_TOKENS
-        chunk_overlap = DocumentChunker.DEFAULT_CHUNK_OVERLAP_TOKENS
-        chunks = DocumentChunker.chunk_document(pages, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-        db_doc.chunk_size = chunk_size
-        db_doc.chunk_overlap = chunk_overlap
+        # 2. Chunk File using parent-child ("small-to-big") hierarchical
+        # chunking (Phase 8b): small "child" chunks get embedded/indexed
+        # for precise retrieval matching, while each child links back to a
+        # larger "parent" chunk (SQL-only, never embedded) that supplies
+        # full context to the LLM once a child wins retrieval -- see
+        # RAGEngine._expand_to_parents. Sizes come from settings so both
+        # ingestion entry points (this + ingest_public_pdfs.py) share one
+        # source of truth instead of drifting the way flat chunk_size did
+        # pre-Phase-8 (450 vs. 1200 tokens with no shared config -- see
+        # Phase 5 CLAUDE.md Work Log entry).
+        parent_size = settings.PARENT_CHUNK_SIZE_TOKENS
+        child_size = settings.CHILD_CHUNK_SIZE_TOKENS
+        child_overlap = settings.CHILD_CHUNK_OVERLAP_TOKENS
+        parents = DocumentChunker.chunk_document_hierarchical(
+            pages, parent_size=parent_size, child_size=child_size, child_overlap=child_overlap
+        )
+        db_doc.parent_chunk_size = parent_size
+        db_doc.chunk_size = child_size
+        db_doc.chunk_overlap = child_overlap
 
-        # Generate vector IDs here -- single source of truth, reused both for
-        # the vector store upsert and the Chunk.vector_id column, instead of
-        # each vector backend independently deriving its own id formula.
-        for c in chunks:
-            c["vector_id"] = f"doc{document_id}_chunk{c['chunk_index']}"
+        # 3. Insert parent rows first (flushed to get real chunks.id values
+        # before inserting their children, since Chunk.parent_id is a
+        # self-FK), then child rows with parent_id set. Vector IDs /
+        # chunk_index are assigned here -- single source of truth, reused
+        # both for the vector store upsert and the Chunk columns, instead
+        # of each vector backend independently deriving its own id
+        # formula. Only children are collected for the vector upsert below
+        # (Phase 8b: parents are SQL-only context, never embedded --
+        # smaller vector index, sharper matches).
+        all_children: List[Dict] = []
+        next_index = 0
+        for parent in parents:
+            if not parent.get("children"):
+                logger.warning(
+                    f"Parent chunk produced zero children during hierarchical "
+                    f"chunking of document {document_id} ({filename}); skipping."
+                )
+                continue
 
-        # 3. Insert chunks in SQL
-        for c in chunks:
-            chunk_obj = Chunk(
+            parent_obj = Chunk(
                 document_id=document_id,
-                text=c["text"],
-                chunk_index=c["chunk_index"],
-                page_number=c["page_number"],
-                section_header=c["section_header"],
-                chunk_metadata=c["chunk_metadata"],
-                vector_id=c["vector_id"]
+                text=parent["text"],
+                chunk_index=next_index,
+                page_number=parent["page_number"],
+                section_header=parent["section_header"],
+                chunk_metadata=parent["chunk_metadata"],
+                is_parent=True,
             )
-            db.add(chunk_obj)
+            db.add(parent_obj)
+            db.flush()  # need parent_obj.id before creating its children
+            next_index += 1
+
+            pending = []
+            for child in parent["children"]:
+                child_index = next_index
+                child["vector_id"] = f"doc{document_id}_chunk{child_index}"
+                child_obj = Chunk(
+                    document_id=document_id,
+                    text=child["text"],
+                    chunk_index=child_index,
+                    page_number=child["page_number"],
+                    section_header=child["section_header"],
+                    chunk_metadata=child["chunk_metadata"],
+                    vector_id=child["vector_id"],
+                    parent_id=parent_obj.id,
+                    is_parent=False,
+                )
+                db.add(child_obj)
+                pending.append((child, child_obj))
+                next_index += 1
+
+            db.flush()  # assign ids to all of this parent's children in one round trip
+            for child, child_obj in pending:
+                child["chunk_id"] = child_obj.id
+                all_children.append(child)
+
         db.commit()
 
-        # 4. Insert in Vector Database (Pinecone or Qdrant based on config)
+        # 4. Insert in Vector Database (children only -- see above)
         vector_backend = get_vector_backend()
         vector_backend.upsert_chunks(
             collection_name=collection_name,
             document_id=document_id,
             filename=filename,
-            chunks=chunks
+            chunks=all_children
         )
 
         # 5. Update document status
         db_doc.status = DocumentStatus.ACTIVE
-        db_doc.total_chunks = len(chunks)
+        db_doc.total_chunks = len(all_children)
         db_doc.error_message = None
         db.commit()
-        logger.info(f"Background ingestion complete for document {document_id} ({filename}): {len(chunks)} chunks")
+        logger.info(
+            f"Background ingestion complete for document {document_id} ({filename}): "
+            f"{len(parents)} parent chunks, {len(all_children)} child chunks"
+        )
 
     except Exception as e:
         logger.exception(f"Background ingestion failed for document {document_id} ({filename})")
@@ -161,7 +210,7 @@ async def upload_document(
     file: UploadFile = File(...),
     collection_name: str = Form("Default"),
     db: Session = Depends(get_db),
-    current_user: User = Depends(admin_only)
+    current_user: User = Depends(consultant_or_above)
 ):
     logger.info(f"User {current_user.email} uploading document: {file.filename} to collection '{collection_name}'")
 
@@ -223,7 +272,7 @@ async def upload_document(
 def delete_document(
     doc_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(admin_only)
+    current_user: User = Depends(consultant_or_above)
 ):
     doc = db.query(Document).filter(Document.id == doc_id).first()
     if not doc:

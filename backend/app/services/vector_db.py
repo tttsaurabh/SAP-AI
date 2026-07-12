@@ -18,12 +18,18 @@ _QDRANT_ID_NAMESPACE = uuid.UUID("6f9cf37c-3b0a-4c1e-9a9e-3b6a9d9d8f4a")
 def get_vector_backend():
     """
     Returns the active vector DB service based on VECTOR_DB_BACKEND setting.
-    Supports 'pinecone' or 'qdrant' (default fallback).
+    Supports 'supabase' (pgvector), 'pinecone', or 'qdrant' (default fallback).
     """
     backend = settings.VECTOR_DB_BACKEND.lower()
+    if backend == "supabase":
+        from app.services.supabase_db import SupabaseDBService
+        logger.info("Vector backend: Supabase pgvector")
+        return SupabaseDBService
     if backend == "pinecone":
         from app.services.pinecone_db import PineconeDBService
+        logger.info("Vector backend: Pinecone")
         return PineconeDBService
+    logger.info("Vector backend: Qdrant (default)")
     return VectorDBService
 
 
@@ -97,7 +103,9 @@ class VectorDBService:
                 "page_number": chunk.get("page_number", 1),
                 "section_header": chunk.get("section_header", ""),
                 "collection_name": collection_name,
-                "vector_id": vector_id
+                "vector_id": vector_id,
+                "chunk_id": chunk.get("chunk_id"),
+                "chunk_index": chunk.get("chunk_index")
             }
             points.append(
                 qmodels.PointStruct(
@@ -166,7 +174,9 @@ class VectorDBService:
                     "filename": payload.get("filename", ""),
                     "page_number": payload.get("page_number", 1),
                     "section_header": payload.get("section_header", ""),
-                    "collection_name": payload.get("collection_name", "")
+                    "collection_name": payload.get("collection_name", ""),
+                    "chunk_id": payload.get("chunk_id"),
+                    "chunk_index": payload.get("chunk_index")
                 })
             return search_hits
         except Exception as e:

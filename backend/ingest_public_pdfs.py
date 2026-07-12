@@ -76,10 +76,20 @@ def ingest_pdf(db: Session, pdf_path: str, filename: str) -> bool:
         logger.warning(f"[SKIP] No content extracted from {filename}")
         return False
 
-    # 2. Chunk
-    chunk_size, chunk_overlap = 1200, 200
-    chunks = DocumentChunker.chunk_document(pages, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-    if not chunks:
+    # 2. Chunk using parent-child ("small-to-big") hierarchical chunking
+    # (Phase 8b) -- same DocumentChunker.chunk_document_hierarchical /
+    # settings-driven sizes as the interactive upload path in
+    # app/api/documents.py's process_document_ingestion, so both entry
+    # points share one source of truth instead of drifting (this script
+    # previously hardcoded 1200/200 tokens while the upload path used the
+    # chunker's 450/80 defaults -- see Phase 5 CLAUDE.md Work Log entry).
+    parent_size = settings.PARENT_CHUNK_SIZE_TOKENS
+    child_size = settings.CHILD_CHUNK_SIZE_TOKENS
+    child_overlap = settings.CHILD_CHUNK_OVERLAP_TOKENS
+    parents = DocumentChunker.chunk_document_hierarchical(
+        pages, parent_size=parent_size, child_size=child_size, child_overlap=child_overlap
+    )
+    if not parents:
         logger.warning(f"[SKIP] No chunks generated for {filename}")
         return False
 
@@ -94,45 +104,85 @@ def ingest_pdf(db: Session, pdf_path: str, filename: str) -> bool:
         document_type="PDF",
         status="processing",
         total_chunks=0,
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
+        parent_chunk_size=parent_size,
+        chunk_size=child_size,
+        chunk_overlap=child_overlap,
     )
     db.add(db_doc)
     db.commit()
     db.refresh(db_doc)
 
     try:
-        # 4. Insert chunks into SQL
-        for c in chunks:
-            chunk_obj = Chunk(
+        # 4. Insert parent rows first (flushed to get real chunks.id values
+        # before inserting their children, since Chunk.parent_id is a
+        # self-FK), then child rows with parent_id set. Only children are
+        # collected for the vector upsert below (parents are SQL-only
+        # context, never embedded).
+        all_children = []
+        next_index = 0
+        for parent in parents:
+            if not parent.get("children"):
+                logger.warning(f"Parent chunk produced zero children for {filename}; skipping.")
+                continue
+
+            parent_obj = Chunk(
                 document_id=db_doc.id,
-                text=c["text"],
-                chunk_index=c["chunk_index"],
-                page_number=c["page_number"],
-                section_header=c["section_header"],
-                chunk_metadata=c["chunk_metadata"],
+                text=parent["text"],
+                chunk_index=next_index,
+                page_number=parent["page_number"],
+                section_header=parent["section_header"],
+                chunk_metadata=parent["chunk_metadata"],
+                is_parent=True,
             )
-            db.add(chunk_obj)
+            db.add(parent_obj)
+            db.flush()
+            next_index += 1
+
+            pending = []
+            for child in parent["children"]:
+                child_index = next_index
+                child["vector_id"] = f"doc{db_doc.id}_chunk{child_index}"
+                child_obj = Chunk(
+                    document_id=db_doc.id,
+                    text=child["text"],
+                    chunk_index=child_index,
+                    page_number=child["page_number"],
+                    section_header=child["section_header"],
+                    chunk_metadata=child["chunk_metadata"],
+                    vector_id=child["vector_id"],
+                    parent_id=parent_obj.id,
+                    is_parent=False,
+                )
+                db.add(child_obj)
+                pending.append((child, child_obj))
+                next_index += 1
+
+            db.flush()
+            for child, child_obj in pending:
+                child["chunk_id"] = child_obj.id
+                all_children.append(child)
+
         db.commit()
 
-        # 5. Upsert to vector DB (Pinecone / Qdrant based on settings)
+        # 5. Upsert to vector DB (children only; Supabase/Pinecone/Qdrant
+        # based on settings)
         vector_backend = get_vector_backend()
         vector_backend.upsert_chunks(
             collection_name=COLLECTION_NAME,
             document_id=db_doc.id,
             filename=filename,
-            chunks=chunks,
+            chunks=all_children,
         )
 
         # 6. Mark active
         db_doc.status = "active"
-        db_doc.total_chunks = len(chunks)
+        db_doc.total_chunks = len(all_children)
         db.commit()
 
         elapsed = time.time() - t0
         msg = (
             f"[DONE] {filename} → {len(pages)} pages, "
-            f"{len(chunks)} chunks in {elapsed:.1f}s"
+            f"{len(parents)} parent chunks, {len(all_children)} child chunks in {elapsed:.1f}s"
         )
         logger.success(msg)
         with open(LOG_FILE, "a", encoding="utf-8") as lf:

@@ -8,6 +8,8 @@ psycopg2-binary==2.9.9
 redis==5.0.6
 qdrant-client==1.9.1
 pinecone>=3.2.2
+# Supabase backend (pgvector vector store)
+supabase>=2.3.0
 google-generativeai==0.5.4
 openai==1.35.3
 anthropic==0.29.0

@@ -42,8 +42,8 @@ try:
             
             # Create a test end-user account as well
             default_user = User(
-                email="consultant@sap.com",
-                hashed_password=get_password_hash("consultantpassword"),
+                email="admin2",
+                hashed_password=get_password_hash("admin"),
                 full_name="SAP Consultant User",
                 role=Role.CONSULTANT,
                 is_active=True

@@ -46,7 +46,7 @@ export default function AdminPage() {
   useEffect(() => {
     const token = getAuthToken();
     const role = getUserRole();
-    const adminRoles = ["Super Admin", "SAP Knowledge Manager"];
+    const adminRoles = ["Super Admin", "SAP Knowledge Manager", "SAP Consultant"];
     
     if (!token || !adminRoles.includes(role)) {
       router.push("/chat");

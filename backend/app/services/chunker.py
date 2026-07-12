@@ -226,6 +226,18 @@ class DocumentChunker:
     DEFAULT_CHUNK_SIZE_TOKENS: int = 450    # target size (300–600 token range)
     DEFAULT_CHUNK_OVERLAP_TOKENS: int = 80  # overlap (75–100 token range)
 
+    # Parent-child ("small-to-big") defaults (Phase 8b). Callers normally
+    # pass settings.PARENT_CHUNK_SIZE_TOKENS / CHILD_CHUNK_SIZE_TOKENS /
+    # CHILD_CHUNK_OVERLAP_TOKENS explicitly (see documents.py's
+    # process_document_ingestion and ingest_public_pdfs.py's ingest_pdf, the
+    # two ingestion entry points) so both stay in sync via one shared config
+    # source instead of drifting the way flat chunk_size did pre-Phase-8
+    # (450 vs. 1200 tokens with no shared config -- see Phase 5 CLAUDE.md
+    # Work Log entry). These are just the fallback if a caller omits them.
+    DEFAULT_PARENT_CHUNK_SIZE_TOKENS: int = 1000
+    DEFAULT_CHILD_CHUNK_SIZE_TOKENS: int = 300
+    DEFAULT_CHILD_CHUNK_OVERLAP_TOKENS: int = 60
+
     @staticmethod
     def chunk_document(
         pages: List[Dict[str, Any]],
@@ -375,3 +387,63 @@ class DocumentChunker:
             f"(target {chunk_size} tokens, overlap {chunk_overlap} tokens)"
         )
         return chunks
+
+    @staticmethod
+    def chunk_document_hierarchical(
+        pages: List[Dict[str, Any]],
+        parent_size: int = DEFAULT_PARENT_CHUNK_SIZE_TOKENS,
+        child_size: int = DEFAULT_CHILD_CHUNK_SIZE_TOKENS,
+        child_overlap: int = DEFAULT_CHILD_CHUNK_OVERLAP_TOKENS,
+    ) -> List[Dict[str, Any]]:
+        """
+        Parent-child ("small-to-big") chunking pipeline (Phase 8b).
+
+        Rationale: large static chunks (e.g. 1200 tokens) add noise to the
+        retrieval match (a query only relevant to one sentence still pulls
+        in the whole surrounding chunk as "the match"), while small chunks
+        lose surrounding context once handed to the LLM. This splits the
+        two concerns: small "child" chunks are what gets embedded/matched
+        against, while each child links back to a larger "parent" chunk
+        (SQL-only, never embedded) that supplies full context once a child
+        wins retrieval -- see `RAGEngine._expand_to_parents` in
+        `rag_engine.py`.
+
+        Implementation reuses `chunk_document` at two granularities rather
+        than duplicating the segment-classification/atomic-block logic:
+        first at `parent_size` (with zero overlap -- parents are meant to
+        tile the document without duplicating content across parent
+        boundaries, since overlap is what the child level provides), then
+        each parent's own resulting text is re-chunked at `child_size`/
+        `child_overlap` using the exact same machinery, so parents and
+        children never disagree about where atomic blocks (code/table/
+        procedure) start and end -- both levels keep them unsplit.
+
+        Returns a flat list of parent dicts (same shape `chunk_document`
+        returns), each with an added `"children"` key: a list of child
+        dicts in that same shape. Parent/child `chunk_index` values are
+        each numbered independently starting at 0 (index *within* their
+        own list) -- the caller (documents.py / ingest_public_pdfs.py) is
+        responsible for turning this into globally-unique DB chunk_index
+        values across parents and children, same as it already owns
+        DB-id/vector_id assignment for `chunk_document`'s flat output.
+        """
+        parents = DocumentChunker.chunk_document(pages, chunk_size=parent_size, chunk_overlap=0)
+
+        for parent in parents:
+            parent_page = {
+                "page": parent["page_number"],
+                "text": parent["text"],
+                "metadata": {"headings": [parent["section_header"]]},
+            }
+            parent["children"] = DocumentChunker.chunk_document(
+                [parent_page], chunk_size=child_size, chunk_overlap=child_overlap
+            )
+
+        total_children = sum(len(p["children"]) for p in parents)
+        logger.info(
+            f"Hierarchical chunking complete: {len(parents)} parent chunks, "
+            f"{total_children} child chunks from {len(pages)} pages "
+            f"(parent target {parent_size} tokens, child target {child_size} "
+            f"tokens, child overlap {child_overlap} tokens)"
+        )
+        return parents

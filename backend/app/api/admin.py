@@ -4,7 +4,7 @@ from sqlalchemy import func
 from typing import List, Dict, Any
 
 from app.core.database import get_db
-from app.core.security import admin_only
+from app.core.security import consultant_or_above
 from app.models.models import User, Document, Chunk, Conversation, Message, Feedback, Collection
 from app.schemas.schemas import DocumentAnalytics, ConversationAnalytics, ChunkResponse, CollectionResponse
 
@@ -13,7 +13,7 @@ router = APIRouter(prefix="/api/admin", tags=["admin"])
 @router.get("/collections", response_model=List[str])
 def list_collections(
     db: Session = Depends(get_db),
-    current_user: User = Depends(admin_only)
+    current_user: User = Depends(consultant_or_above)
 ):
     """
     Backward-compatible endpoint: returns distinct collection names as bare
@@ -31,7 +31,7 @@ def list_collections(
 @router.get("/collections/full", response_model=List[CollectionResponse])
 def list_collections_full(
     db: Session = Depends(get_db),
-    current_user: User = Depends(admin_only)
+    current_user: User = Depends(consultant_or_above)
 ):
     """
     Returns the real Collection rows (id, name, embedding_model, etc.) now
@@ -43,7 +43,7 @@ def list_collections_full(
 @router.get("/analytics/documents", response_model=DocumentAnalytics)
 def get_document_analytics(
     db: Session = Depends(get_db),
-    current_user: User = Depends(admin_only)
+    current_user: User = Depends(consultant_or_above)
 ):
     total_docs = db.query(Document).count()
     total_chunks = db.query(Chunk).count()
@@ -68,7 +68,7 @@ def get_document_analytics(
 @router.get("/analytics/conversations", response_model=ConversationAnalytics)
 def get_conversation_analytics(
     db: Session = Depends(get_db),
-    current_user: User = Depends(admin_only)
+    current_user: User = Depends(consultant_or_above)
 ):
     total_convs = db.query(Conversation).count()
     total_msgs = db.query(Message).count()
@@ -89,7 +89,7 @@ def get_conversation_analytics(
 def get_chunks(
     document_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(admin_only)
+    current_user: User = Depends(consultant_or_above)
 ):
     # Verify document exists
     doc = db.query(Document).filter(Document.id == document_id).first()
