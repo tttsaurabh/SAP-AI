@@ -5,7 +5,8 @@
       "Bash(git commit -m ' *)",
       "Bash(venv/Scripts/python.exe -c \"import ast; ast.parse\\(open\\('app/main.py'\\).read\\(\\)\\); ast.parse\\(open\\('app/api/chat.py'\\).read\\(\\)\\); ast.parse\\(open\\('app/services/rag_engine.py'\\).read\\(\\)\\); ast.parse\\(open\\('app/core/timing.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
       "Bash(venv/Scripts/python.exe -c ' *)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(./venv/Scripts/python.exe test_single_reingest.py)"
     ]
   }
 }

@@ -1,4 +1,7 @@
 import hashlib
+import threading
+import time
+from collections import deque
 import numpy as np
 from typing import List, Union
 from loguru import logger
@@ -23,6 +26,56 @@ except ImportError:
 
 class EmbeddingsService:
     _local_model = None
+    # gemini-embedding-001 caps items per embed_content request (~100); larger
+    # requests return ResourceExhausted. Keep sub-batches at/under this.
+    _GEMINI_EMBED_BATCH = 100
+    # Free-tier rate limit: 100 embeddings/minute. Throttle to 90/min (1.5s per item).
+    _GEMINI_RATE_LIMIT_PER_SEC = 90.0 / 60.0  # items per second
+    _gemini_rate_tokens = deque(maxlen=100)
+    _gemini_rate_lock = threading.Lock()
+
+    @classmethod
+    def _rate_limit_gemini(cls, num_items: int) -> None:
+        """Throttle Gemini embedding calls to stay under 100/min free-tier quota."""
+        now = time.time()
+        with cls._gemini_rate_lock:
+            # Remove tokens older than 60 seconds
+            while cls._gemini_rate_tokens and cls._gemini_rate_tokens[0] < now - 60:
+                cls._gemini_rate_tokens.popleft()
+            # Check if adding num_items would exceed the 90/min target
+            if len(cls._gemini_rate_tokens) + num_items > 90:
+                # Sleep until oldest token is 60s old
+                sleep_until = cls._gemini_rate_tokens[0] + 60
+                delay = max(0, sleep_until - now)
+                if delay > 0:
+                    logger.info(f"Rate-limiting: sleeping {delay:.1f}s to stay under 100/min quota")
+                    time.sleep(delay)
+            # Record this batch
+            for _ in range(num_items):
+                cls._gemini_rate_tokens.append(time.time())
+
+    @staticmethod
+    def _gemini_embed_with_retry(model: str, texts: List[str], out_dim: int, attempts: int = 3):
+        """Call genai.embed_content with a short exponential backoff so a
+        transient per-minute rate-limit (ResourceExhausted) during a bulk
+        re-ingest is retried rather than failing the whole document."""
+        import time as _time
+        last_exc = None
+        for i in range(attempts):
+            try:
+                return genai.embed_content(
+                    model=model,
+                    content=texts,
+                    task_type="retrieval_document",
+                    output_dimensionality=out_dim,
+                )
+            except Exception as e:  # noqa: BLE001 -- retried/re-raised below
+                last_exc = e
+                if "ResourceExhausted" in type(e).__name__ or "429" in str(e):
+                    _time.sleep(2 ** i)  # 1s, 2s, 4s
+                    continue
+                raise
+        raise last_exc if last_exc else RuntimeError("Gemini embedding failed after retries")
 
     @classmethod
     def warm_up(cls) -> None:
@@ -115,15 +168,23 @@ class EmbeddingsService:
                 # dimension so it matches the stored pgvector column and stays
                 # <=2000 for indexability.
                 out_dim = settings.EMBEDDING_DIMENSION
-                result = genai.embed_content(
-                    model=model,
-                    content=texts,
-                    task_type="retrieval_document",
-                    output_dimensionality=out_dim,
-                )
-                embeddings = result["embedding"]  # list-of-lists (input is a list)
-                if out_dim != 3072:
-                    embeddings = [cls._l2_normalize(e) for e in embeddings]
+                # gemini-embedding-001 rejects large per-request batches
+                # (ResourceExhausted above ~100 items), so split into sub-batches.
+                # Apply free-tier rate limiting (90/min) between batches.
+                embeddings: List[List[float]] = []
+                for start in range(0, len(texts), cls._GEMINI_EMBED_BATCH):
+                    sub = texts[start:start + cls._GEMINI_EMBED_BATCH]
+                    cls._rate_limit_gemini(len(sub))
+                    result = cls._gemini_embed_with_retry(model, sub, out_dim)
+                    vecs = result["embedding"]
+                    # embed_content returns a flat list for a single-string input
+                    # and a list-of-lists for a list input; `sub` is always a list,
+                    # but guard the single-item case defensively.
+                    if vecs and not isinstance(vecs[0], (list, tuple)):
+                        vecs = [vecs]
+                    if out_dim != 3072:
+                        vecs = [cls._l2_normalize(v) for v in vecs]
+                    embeddings.extend(vecs)
                 return embeddings
             except Exception as e:
                 logger.error(f"Gemini embedding generation failed: {str(e)}")
