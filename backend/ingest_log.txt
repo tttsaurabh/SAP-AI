@@ -25,3 +25,5 @@
 [DONE] Master Data Governance Application Programming Interface Guide.pdf → 28 pages, 38 chunks in 44.9s
 [DONE] SAP Master Data Governance, Consolidation.pdf → 51 pages, 9 chunks in 53.9s
 [DONE] Set up Parallel Workflow Tasks with BRF+ (BADI USMD_SSW_PARA_RESULT_HANDLER).pdf → 26 pages, 43 chunks in 32.3s
+[DONE] Enable Dynamic Parallel Approval for Company Code Data in Rule-based Workflow.pdf → 15 pages, 16 parent chunks, 19 child chunks in 10.4s
+[DONE] How to... MDG-M_ Use the Data Import Framework.pdf → 27 pages, 24 parent chunks, 55 child chunks in 109.2s
